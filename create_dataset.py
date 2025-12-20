@@ -66,11 +66,32 @@ class FrameCollector:
                 repo_id=f"sb3/ppo-{self.env_name}",
                 filename=f"ppo-{self.env_name}.zip",
             )
-            self.model = PPO.load(checkpoint)
+
+            # Some models saved with older SB3 / Python versions serialize
+            # callables (schedules / lambdas) that cannot be deserialized
+            # in newer runtimes (code object signature mismatch). Provide
+            # safe replacements via `custom_objects` to avoid those errors.
+            custom_objects = {
+                "learning_rate": 2.5e-4,
+                "lr_schedule": (lambda _: 2.5e-4),
+                "clip_range": (lambda _: 0.2),
+            }
+
+            try:
+                self.model = PPO.load(checkpoint, custom_objects=custom_objects)
+            except Exception as inner_e:
+                # If the full replacement fails, try a minimal replacement
+                # and if that still fails fall back to using a random agent.
+                print(f"Warning: full custom_objects load failed: {inner_e}")
+                try:
+                    self.model = PPO.load(checkpoint, custom_objects={"learning_rate": 2.5e-4})
+                except Exception as inner_e2:
+                    print(f"Error loading model after fallback: {inner_e2}")
+                    print("Falling back to standard loading")
+                    self.model = PPO.load(checkpoint)
             return True
         except Exception as e:
-            print(f"Error loading model: {e}")
-            return False
+            raise RuntimeError(f"Error loading model for {self.env_name}: {e}")
 
     def collect_frames_gameplay(self, n_episodes=3, max_steps_per_episode=1000, use_random_agent=False):
         print(f"Starting gameplay for {n_episodes} episodes...")
