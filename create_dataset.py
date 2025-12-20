@@ -1,4 +1,13 @@
 import os
+import numpy as np
+from tqdm import tqdm 
+import random
+from pathlib import Path
+from PIL import Image
+import matplotlib.pyplot as plt  # Only needed if you want to plot somewhere else
+import yaml
+import random
+
 
 HF_CACHE_DIR = ".hf_cache"
 os.makedirs(HF_CACHE_DIR, exist_ok=True)
@@ -10,29 +19,30 @@ os.environ["SB3_CACHE"] = HF_CACHE_DIR
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-import gymnasium as gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_atari_env
-from stable_baselines3.common.vec_env import VecFrameStack
-import numpy as np
-from tqdm import tqdm
-from huggingface_sb3 import load_from_hub
-from pathlib import Path
-from PIL import Image
-import matplotlib.pyplot as plt  # Only needed if you want to plot somewhere else
-import random
-import ale_py
+import gymnasium as gym # noqa: E402
+from stable_baselines3 import PPO  # noqa: E402
+from stable_baselines3.common.env_util import make_atari_env # noqa: E402
+from stable_baselines3.common.vec_env import VecFrameStack # noqa: E402
+
+from huggingface_sb3 import load_from_hub # noqa: E402
+import ale_py # noqa: E402
 
 gym.register_envs(ale_py)
 
-ENVS = [
-    "BreakoutNoFrameskip-v4",
-    "PongNoFrameskip-v4",
-    "MsPacmanNoFrameskip-v4",
-]
-EPISODES = 10
-MAX_STEPS_PER_EPISODE_RANDOM_AGENT = 100
-MAX_STEPS_PER_EPISODE_EXPERT_AGENT = 100
+# Load shared configuration
+_config_path = Path(__file__).resolve().parent / "configs.yaml"
+_config = {}
+if _config_path.exists():
+    with open(_config_path, "r") as f:
+        _config = yaml.safe_load(f) or {}
+
+ENVS = _config.get("ENVS", [])
+
+
+EPISODES = _config.get("EPISODES", 10)
+MAX_STEPS_PER_EPISODE_RANDOM_AGENT = _config.get("MAX_STEPS_PER_EPISODE_RANDOM_AGENT", 100)
+MAX_STEPS_PER_EPISODE_EXPERT_AGENT = _config.get("MAX_STEPS_PER_EPISODE_EXPERT_AGENT", 100)
+BASE_DATA_PATH = _config.get("data_path", "./data")
 
 
 class FrameCollector:
@@ -43,7 +53,7 @@ class FrameCollector:
         self.n_stack = n_stack
         self.model = None
         self.env = None
-        self.base_path = "./data"
+        self.base_path = BASE_DATA_PATH
         self.create_environment()
         
     def create_environment(self):
@@ -206,8 +216,8 @@ if __name__ == "__main__":
             use_random_agent=True
         )
         
-        collector.collect_frames_gameplay(
-            n_episodes=EPISODES,
-            max_steps_per_episode=MAX_STEPS_PER_EPISODE_EXPERT_AGENT,
-            use_random_agent=False
-        )
+        # collector.collect_frames_gameplay(
+        #     n_episodes=EPISODES,
+        #     max_steps_per_episode=MAX_STEPS_PER_EPISODE_EXPERT_AGENT,
+        #     use_random_agent=False
+        # )

@@ -6,6 +6,14 @@ from PIL import Image
 from torch.utils.data import Dataset, Sampler
 import os
 import random
+from .skill_interface import Skill, model_forward
+from torch import Tensor
+
+
+def obj_key_input_trans(x: Tensor):
+    x = x.float()
+    x = x[:, -1, ...]
+    return x.unsqueeze(1)
 
 class Encoder(nn.Module):
     def __init__(self, inp_ch=3):
@@ -142,14 +150,13 @@ def transport(source_keypoints, target_keypoints, source_features, target_featur
     return out
 
 class Transporter(nn.Module):
-    def __init__(self, encoder, keynet, refinenet, std=0.1):
+    def __init__(self, std=0.1):
         super().__init__()
-
-        self.encoder = encoder
-        self.key_net = keynet
-        self.refine_net = refinenet
+        self.encoder = Encoder(inp_ch=1)
+        self.key_net = KeyNet(inp_ch=1, K=4)
+        self.refine_net = RefineNet(num_ch=1)
         self.std = std
-
+        
     def forward(self, source_img, target_img):
         # source img
         source_features = self.encoder(source_img)
@@ -172,6 +179,25 @@ class Transporter(nn.Module):
         # RefineNet
         out = self.refine_net(transport_features)
         return out
+    
+    def get_skill(self, device, keynet_or_encoder='encoder'):
+        input_transformation_function = obj_key_input_trans
+        # here I should load the .pt model
+        model_path = "skills/torch_models/vid-obj-key.pt"
+        
+        model = Transporter(std=self.std)
+        state = torch.load(model_path, map_location=device)
+        # load_state_dict returns an _IncompatibleKeys namedtuple; call it but keep the model
+        _ = model.load_state_dict(state, strict=True)
+        model.eval()
+        model.to(device)
+        
+        if keynet_or_encoder == 'encoder':
+            return Skill("obj_key_key", input_transformation_function, model.encoder, model_forward, None)
+        elif keynet_or_encoder == 'keynet':
+            return Skill("obj_key_enc", input_transformation_function, model.key_net, model_forward, None)
+        else:
+            raise ValueError("keynet_or_encoder must be either 'encoder' or 'keynet'")
 
 
 class ObjectKeypointsDataset(Dataset):

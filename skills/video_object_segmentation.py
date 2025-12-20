@@ -7,6 +7,8 @@ import os
 import random
 from PIL import Image
 import cv2
+from .skill_interface import Skill
+from torch import Tensor
 
 class Flatten(nn.Module):
     def forward(self, x):
@@ -262,6 +264,29 @@ class VideoObjectSegmentationModel(nn.Module):
         output = wa*Ia + wb*Ib + wc*Ic + wd*Id
 
         return output
+    
+    def vos_output_masks(self, model, x):
+        return model.compute_masks(x)
+
+    def vid_obj_seg_input_trans(self, x: Tensor):
+        x = x.float()
+        first_frames = torch.mean(x[:, :2, ...], 1)
+        second_frames = torch.mean(x[:, 2:, ...], 1)
+        s = torch.stack([first_frames, second_frames])
+        norm_s = s / 255.
+        return norm_s.permute(1, 0, 2, 3)
+
+    
+    def get_skill(self, device):
+        model_path = "skills/torch_models/vid-obj-seg.pt"
+        
+        model = VideoObjectSegmentationModel(device=device)
+        state = torch.load(model_path, map_location=device)
+        _ = model.load_state_dict(state, strict=True)
+        model.eval()
+        model.to(device)
+        
+        return Skill("vid_obj_seg", self.vid_obj_seg_input_trans, model, self.vos_output_masks, None)
     
     
     

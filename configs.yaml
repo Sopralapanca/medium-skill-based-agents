@@ -1,0 +1,20 @@
+# Shared configuration for training and dataset scripts
+# max training steps for each skill
+max_training_steps: 500
+
+# Environments used across scripts
+ENVS:
+  #- BreakoutNoFrameskip-v4
+  - PongNoFrameskip-v4
+  #- MsPacmanNoFrameskip-v4
+
+# Dataset / common parameters
+EPISODES: 100
+MAX_STEPS_PER_EPISODE_RANDOM_AGENT: 100
+MAX_STEPS_PER_EPISODE_EXPERT_AGENT: 100
+
+# Shared paths and preprocessing
+data_path: ./data
+IMG_SZ: 84
+batch_size: 128
+

@@ -1,4 +1,6 @@
 import torch
+from pathlib import Path
+import yaml
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from skills.video_object_keypoints import (
@@ -15,15 +17,22 @@ import numpy as np
 import os
 
 IMG_SZ = 84
-MAX_ITER = 1000000
-EPISODES = 10
-batch_size = 32
+# Load config for max iterations
+_config_path = Path(__file__).resolve().parent / "configs.yaml"
+_config = {}
+if _config_path.exists():
+    with open(_config_path, "r") as f:
+        _config = yaml.safe_load(f) or {}
+MAX_ITER = _config.get("max_training_steps", 1000000)
+EPISODES = _config.get("EPISODES", 10)
+batch_size = _config.get("batch_size", 32)
 image_channels = 1
 K = 4
 lr = 1e-3
 lr_decay = 0.95
 lr_decay_len = int(1e5)
-data_path = "./data"
+IMG_SZ = _config.get("IMG_SZ", 84)
+data_path = _config.get("data_path", "./data")
 
 def main():
     

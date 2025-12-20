@@ -1,0 +1,30 @@
+# Pong configuration file
+
+config : {
+
+    "n_envs": 8,
+    "n_stacks": 4,
+
+    "n_steps": 128,
+    "n_epochs": 4,
+    "batch_size": 256,
+    "n_timesteps": 10000000, #1e7
+    "learning_rate": 2.5e-4,
+    "clip_range": 0.1,
+    "vf_coef": 0.5,
+    "ent_coef": 0.01,
+    "normalize": True,
+
+    "net_arch_pi": [256],
+    "net_arch_vf": [256],
+
+    "f_ext_name": "None",
+
+    #"f_ext_ft_dim": 16896,
+
+    # filled with other parameters at runtime according to the extractor used
+    "f_ext_kwargs": {
+        "features_dim": 0, #final dimension of the embedding before passing it to policy net or value function net
+    },
+
+}

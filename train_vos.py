@@ -1,10 +1,20 @@
 import torch
 from tqdm import tqdm
+from pathlib import Path
+import yaml
+import os
 from skills.video_object_segmentation import VOSDataset, VideoObjectSegmentationModel
 
 num_frames = 2
-batch_size = 32
-steps = 1000000
+# Load shared config
+_config_path = Path(__file__).resolve().parent / "configs.yaml"
+_config = {}
+if _config_path.exists():
+    with open(_config_path, "r") as f:
+        _config = yaml.safe_load(f) or {}
+
+batch_size = _config.get("batch_size", 32)
+steps = _config.get("max_training_steps", 1000000)
 lr = 1e-4
 max_grad_norm = 5.0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
