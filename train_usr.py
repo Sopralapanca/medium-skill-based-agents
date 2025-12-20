@@ -82,7 +82,7 @@ args = {
 args = Args(**args)
 
 observation_shape = all_tr_eps[0][0].shape
-encoder = NatureCNN(observation_shape[0], args)
+encoder = NatureCNN(observation_shape[0], args).to(device)
 
 config = {}
 config.update(vars(args))
