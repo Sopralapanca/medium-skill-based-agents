@@ -6,6 +6,8 @@ import torch
 from .skill_interface import Skill, model_forward
 from torch import Tensor
 import torch.nn.functional as F
+import torch.nn as nn
+
 
 
 def _get_episodes(env_name, steps, collect_mode):
@@ -40,7 +42,8 @@ class UnsupervisedStateRepresentationModel:
 
         self.args = Args(**args)
         
-        self.observation_shape = observation.shape
+        self.observation_shape = observation.shape # (1, 210, 160)
+    
         self.encoder = NatureCNN(input_channels=self.observation_shape[0], args=self.args).to(device)
 
         config = {}
@@ -63,13 +66,16 @@ class UnsupervisedStateRepresentationModel:
     
     def state_rep_input_trans(self, x: Tensor):
         x = x.float()
-        return F.interpolate(x, (160, 210), mode='bilinear', align_corners=True)
+        #extract last frame from stacked frames
+        x = x[:, -1:, :, :]
+        x = F.interpolate(x, (160, 210), mode='bilinear', align_corners=True)
+        return x.contiguous()
     
     def get_skill(self, device):
         input_transformation_function = self.state_rep_input_trans
         model_path = "skills/torch_models/state-rep.pt"
 
-        model = NatureCNN(self.observation_shape[0], args=self.args).to(device)
+        model = NatureCNNEncoder(input_channels=1, feature_size=512).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
         model.eval()
         adapter = None
@@ -101,3 +107,32 @@ class DummyWandB:
 
     def finish(self):
         pass
+    
+
+class Flatten(nn.Module):
+    def forward(self, x):
+        return torch.reshape(x, (x.size(0), -1))
+
+class NatureCNNEncoder(nn.Module):
+    def __init__(self, input_channels, feature_size):
+        super().__init__()
+        self.feature_size = feature_size
+        self.input_channels = input_channels
+        self.final_conv_size = 64 * 9 * 6
+
+        self.main = nn.Sequential(
+            nn.Conv2d(input_channels, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, 3, stride=1),
+            nn.ReLU(),
+            Flatten(),
+            nn.Linear(self.final_conv_size, self.feature_size),
+            #nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.main(x)

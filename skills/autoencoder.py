@@ -40,10 +40,12 @@ class Autoencoder(nn.Module):
     def get_skill(self, device):
         model_path = "skills/torch_models/nature-encoder.pt"
 
-        model = self.load_state_dict(torch.load(model_path, map_location=device), strict=True).to(device)
-        model.eval()
+        self.load_state_dict(torch.load(model_path, map_location=device), strict=True)
+        self.to(device)
+        self.eval()
+        
         input_transformation_function = self.autoencoder_input_trans
-        return Skill("autoencoder", input_transformation_function, model.encoder, model_forward, None)
+        return Skill("autoencoder", input_transformation_function, self.encoder, model_forward, None)
     
     
 class AutoencoderDataset(Dataset):

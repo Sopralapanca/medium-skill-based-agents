@@ -25,7 +25,8 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         #TODO: change spatial adapters
 
         # [hardcoded] adapters using 1x1 conv
-        # this are used to convert spatial embeddings to linear embeddings
+        # this is to obtain fixed size spatial embeddings from skills that output spatial embeddings
+        # torch.Size([x, x, 16, 16]) (env, stacked frames, height, width) 
         self.__vobj_seg_adapter = nn.Sequential(
             nn.Conv2d(20, 16, 1),
             nn.Conv2d(16, 16, 5, 5),
@@ -71,11 +72,14 @@ class FeaturesExtractor(BaseFeaturesExtractor):
             with torch.no_grad():
                 so = skill.input_adapter(observations)
                 so = skill.skill_output(skill.skill_model, so) # can return linear or spatial embeddings
-                
-            # from spatial to linear embeddings if needed        
+                       
             if skill.name in self.adapters:
                 adapter = self.adapters[skill.name]
                 so = adapter(so)
+            
+            # flatten skill out to linear embedding
+            if len(so.shape) > 2:
+                so = torch.reshape(so, (so.size(0), -1))  
 
             self.skills_embeddings.append(so)
             
@@ -110,8 +114,7 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         #dropout_p = 0.1
 
         self.preprocess_input(sample) # this will populate self.skills_embeddings
-
-        
+            
         # linear layers to learn a representation of the skills
         self.mlp_layers = nn.ModuleList()
         for i in range(len(self.skills_embeddings)):

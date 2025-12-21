@@ -193,9 +193,9 @@ class Transporter(nn.Module):
         model.to(device)
         
         if keynet_or_encoder == 'encoder':
-            return Skill("obj_key_key", input_transformation_function, model.encoder, model_forward, None)
+            return Skill("obj_key_enc", input_transformation_function, model.encoder, model_forward, None)
         elif keynet_or_encoder == 'keynet':
-            return Skill("obj_key_enc", input_transformation_function, model.key_net, model_forward, None)
+            return Skill("obj_key_key", input_transformation_function, model.key_net, model_forward, None)
         else:
             raise ValueError("keynet_or_encoder must be either 'encoder' or 'keynet'")
 
