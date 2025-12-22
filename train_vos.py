@@ -13,14 +13,13 @@ if _config_path.exists():
     with open(_config_path, "r") as f:
         _config = yaml.safe_load(f) or {}
 
-batch_size = _config.get("batch_size", 16)  # Paper uses batch_size=16
+batch_size = 32 # _config.get("batch_size", 16)  # Paper uses batch_size=16
 steps = 250000  # Paper uses 250k steps
 lr = 1e-4
 max_grad_norm = 5.0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 data_path = "./data"
 val_frequency = 5000  # Run validation every N steps to save time
-debug_frequency = 5000  # Print debug info every N steps
 
 game = "pong"
 # Use frame_skip=3 to sample frames 3 timesteps apart for more visible motion
@@ -32,6 +31,7 @@ inp = data.get_batch("train").to(device)
 curriculum_steps = 100000
 model = VideoObjectSegmentationModel(device=device, curriculum_steps=curriculum_steps)
 model.to(device)
+model = torch.compile(model, mode='default')
 
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 def lamb(epoch):
@@ -57,22 +57,6 @@ for i in pbar:
     x0_ = model(model_input)
     tr_loss = model.compute_loss(x0, x0_)
     
-    # Debug: print key metrics periodically
-    if i % debug_frequency == 0:
-        with torch.no_grad():
-            frame_diff = torch.abs(x0 - x1).mean().item()
-            recon_diff = torch.abs(x0 - x0_).mean().item()
-            mask_mean = model.object_masks.mean().item()
-            mask_max = model.object_masks.max().item()
-            flow_magnitude = torch.sqrt(
-                (model.translation_masks ** 2).sum(dim=2)
-            ).mean().item()
-            print(f"\n--- Debug Step {i} ---")
-            print(f"Frame diff (x0-x1): {frame_diff:.6f}")
-            print(f"Recon error (x0-x0_): {recon_diff:.6f}")
-            print(f"Mask mean: {mask_mean:.6f}, max: {mask_max:.6f}")
-            print(f"Flow magnitude: {flow_magnitude:.6f}")
-            print(f"Lambda_reg: {model.of_reg_cur:.6f}")
     tr_loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()

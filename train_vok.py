@@ -24,7 +24,7 @@ _config = {}
 if _config_path.exists():
     with open(_config_path, "r") as f:
         _config = yaml.safe_load(f) or {}
-MAX_ITER = 1000 #_config.get("max_training_steps", 1000000)
+MAX_ITER = _config.get("max_training_steps", 1000000)
 batch_size = _config.get("batch_size", 32)
 image_channels = 1
 K = 4
