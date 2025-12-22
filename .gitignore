@@ -1,0 +1,13 @@
+.*
+
+__pycache__/
+tmp/
+tensorboard_logs/
+eval_logs/
+data/
+data_pt/
+build/
+*.egg-info/
+
+
+!.gitignore
