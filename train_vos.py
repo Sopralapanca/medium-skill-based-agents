@@ -13,18 +13,24 @@ if _config_path.exists():
     with open(_config_path, "r") as f:
         _config = yaml.safe_load(f) or {}
 
-batch_size = _config.get("batch_size", 32)
-steps = _config.get("max_training_steps", 1000000)
+batch_size = _config.get("batch_size", 16)  # Paper uses batch_size=16
+steps = 250000  # Paper uses 250k steps
 lr = 1e-4
 max_grad_norm = 5.0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 data_path = "./data"
+val_frequency = 5000  # Run validation every N steps to save time
+debug_frequency = 5000  # Print debug info every N steps
 
-data = VOSDataset(batch_size, num_frames, data_path)
+game = "pong"
+# Use frame_skip=3 to sample frames 3 timesteps apart for more visible motion
+# Atari games run at ~60fps, so skip=3 gives ~20fps effective sampling rate
+data = VOSDataset(batch_size, num_frames, data_path, game=game, frame_skip=3)
 inp = data.get_batch("train").to(device)
 
-
-model = VideoObjectSegmentationModel(device=device)
+# Paper uses curriculum over 100k steps to linearly increase lambda_reg from 0 to 1
+curriculum_steps = 100000
+model = VideoObjectSegmentationModel(device=device, curriculum_steps=curriculum_steps)
 model.to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -40,24 +46,53 @@ for i in pbar:
     model.train()
     optimizer.zero_grad()
     inp = data.get_batch("train").to(device)
-    x0_ = model(inp)
-    x0 = torch.unsqueeze(inp[:, 0, :, :], 1)
+    
+    # inp shape: [batch_size, num_frames, H, W]
+    # Extract x0 (first frame) and create input with x0 and x1 (two consecutive frames)
+    x0 = torch.unsqueeze(inp[:, 0, :, :], 1)  # [batch_size, 1, H, W]
+    x1 = torch.unsqueeze(inp[:, 1, :, :], 1)  # [batch_size, 1, H, W]
+    model_input = torch.cat([x0, x1], dim=1)  # [batch_size, 2, H, W]
+    
+    # Model reconstructs x0 from x1 using optical flow
+    x0_ = model(model_input)
     tr_loss = model.compute_loss(x0, x0_)
+    
+    # Debug: print key metrics periodically
+    if i % debug_frequency == 0:
+        with torch.no_grad():
+            frame_diff = torch.abs(x0 - x1).mean().item()
+            recon_diff = torch.abs(x0 - x0_).mean().item()
+            mask_mean = model.object_masks.mean().item()
+            mask_max = model.object_masks.max().item()
+            flow_magnitude = torch.sqrt(
+                (model.translation_masks ** 2).sum(dim=2)
+            ).mean().item()
+            print(f"\n--- Debug Step {i} ---")
+            print(f"Frame diff (x0-x1): {frame_diff:.6f}")
+            print(f"Recon error (x0-x0_): {recon_diff:.6f}")
+            print(f"Mask mean: {mask_mean:.6f}, max: {mask_max:.6f}")
+            print(f"Flow magnitude: {flow_magnitude:.6f}")
+            print(f"Lambda_reg: {model.of_reg_cur:.6f}")
     tr_loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
     scheduler.step()
 
-    with torch.no_grad():
-        model.eval()
-        inp = data.get_batch("val").to(device)
-        x0_ = model(inp)
-        x0 = torch.unsqueeze(inp[:, 0, :, :], 1)
-        val_loss = model.compute_loss(x0, x0_)
-
+    # Validation (run less frequently)
+    if i % val_frequency == 0:
+        with torch.no_grad():
+            model.eval()
+            inp_val = data.get_batch("val").to(device)
+            x0_val = torch.unsqueeze(inp_val[:, 0, :, :], 1)
+            x1_val = torch.unsqueeze(inp_val[:, 1, :, :], 1)
+            model_input_val = torch.cat([x0_val, x1_val], dim=1)
+            x0_val_ = model(model_input_val)
+            val_loss = model.compute_loss(x0_val, x0_val_)
+    
     model.update_reg()
 
-    if val_loss <= best_val_loss:
+    # Only update best model when validation is computed
+    if i % val_frequency == 0 and val_loss <= best_val_loss:
         best_val_loss = val_loss
         at_step = i
         #print(f"Step: {i} new best val_loss : {val_loss}")

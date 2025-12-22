@@ -10,17 +10,21 @@ import cv2
 from .skill_interface import Skill
 from torch import Tensor
 
+
 class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
 
+
 class VideoObjectSegmentationModel(nn.Module):
-    def __init__(self, device="cpu", emb_size=512, K=20, depth=24, H=84, W=84):
+    def __init__(self, device="cpu", emb_size=512, K=20, depth=24, H=84, W=84, curriculum_steps=100000):
         super().__init__()
         self.device = device
 
+        # Regularization curriculum: linearly increase from 0 to 1 over curriculum_steps
+        # Paper uses 100k steps
         self.of_reg_cur = 0.0
-        self.of_reg_inc = 1e-5
+        self.of_reg_inc = 1.0 / curriculum_steps
         self.emb_size = emb_size
         self.K = K
         self.depth = depth
@@ -36,21 +40,29 @@ class VideoObjectSegmentationModel(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 64, 3, stride=1),
             nn.ReLU(),
-            Flatten()
+            Flatten(),
         )
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
         self.fc_conv = nn.Linear(self.final_conv_size, emb_size)
 
-        self.obj_trans = nn.Linear(emb_size, self.K*2)
+        self.obj_trans = nn.Linear(emb_size, self.K * 2)
         self.cam_trans = nn.Linear(emb_size, 2)
 
-        self.fc_m1 = nn.Linear(emb_size, 21*21*self.depth)
+        self.fc_m1 = nn.Linear(emb_size, 21 * 21 * self.depth)
         self.conv_m1 = nn.Conv2d(self.depth, self.depth, 3, 1, 1)
         self.conv_m2 = nn.Conv2d(self.depth, self.depth, 3, 1, 1)
         self.conv_m3 = nn.Conv2d(self.depth, self.K, 1, 1)
         self.upsample1 = nn.UpsamplingBilinear2d(size=(42, 42))
         self.upsample2 = nn.UpsamplingBilinear2d(size=(84, 84))
+
+        # Cache mesh grid - create once and register as buffer
+        self.register_buffer('mesh_grid', self._create_mesh_grid())
+        
+        # Cache img_size_f - create once
+        self.register_buffer('img_size_f', torch.from_numpy(
+            self.flow_c * np.array([[self.H], [self.W]], dtype=np.float32)
+        ))
 
     def compute_masks(self, input):
         # input shape = [ BS x C x H x W ]
@@ -65,7 +77,7 @@ class VideoObjectSegmentationModel(nn.Module):
         m = self.upsample1(m)
 
         # conv 5
-        y = self.conv_m1(m)      # padding=1 => padding='same'
+        y = self.conv_m1(m)  # padding=1 => padding='same'
         m = self.relu(m + y)
         m = self.upsample2(m)
 
@@ -92,7 +104,7 @@ class VideoObjectSegmentationModel(nn.Module):
         m = self.upsample1(m)
 
         # conv 5
-        y = self.conv_m1(m)      # padding=1 => padding='same'
+        y = self.conv_m1(m)  # padding=1 => padding='same'
         m = self.relu(m + y)
         m = self.upsample2(m)
 
@@ -111,7 +123,8 @@ class VideoObjectSegmentationModel(nn.Module):
         ot = torch.reshape(ot, (-1, self.K, 2))
 
         # Mesh Grid
-        mesh_grid = self._create_mesh_grid().to(self.device)
+        #mesh_grid = self._create_mesh_grid().to(self.device)
+        mesh_grid = self.mesh_grid
 
         # Optical Flow
         # [ BS x K x 1 x H x W ]
@@ -127,7 +140,7 @@ class VideoObjectSegmentationModel(nn.Module):
         flow = torch.sum(translation_masks, 1)
 
         # [ BS x 2 x H*W ]
-        flat_flow = torch.reshape(flow, (-1, 2, self.W*self.H))
+        flat_flow = torch.reshape(flow, (-1, 2, self.W * self.H))
 
         # Camera Translation
         # [ BS x 2 ]
@@ -139,7 +152,10 @@ class VideoObjectSegmentationModel(nn.Module):
         flat_flow = flat_flow + ct
 
         # Add in the default coordinates
-        img_size_f = torch.from_numpy(self.flow_c * np.array([[self.H], [self.W]], dtype=np.float32)).to(self.device)
+        # img_size_f = torch.from_numpy(
+        #     self.flow_c * np.array([[self.H], [self.W]], dtype=np.float32)
+        # ).to(self.device)
+        img_size_f = self.img_size_f
         img_size_flat_flow = img_size_f * flat_flow
 
         # [ BS x 2 x H*W]
@@ -168,7 +184,9 @@ class VideoObjectSegmentationModel(nn.Module):
         out_loss = ssim_loss(x, x_, 11)
 
         # L1 reg for translations masks
-        of_loss_reg = torch.abs(self.translation_masks).mean(-1).mean(-1).mean(-1).mean(-1)
+        of_loss_reg = (
+            torch.abs(self.translation_masks).mean(-1).mean(-1).mean(-1).mean(-1)
+        )
 
         loss = out_loss + self.of_reg_cur * of_loss_reg
 
@@ -179,8 +197,8 @@ class VideoObjectSegmentationModel(nn.Module):
         self.of_reg_cur = min(self.of_reg_cur + self.of_reg_inc, 1)
 
     def _create_mesh_grid(self):
-        x_lin = torch.linspace(0., self.W - 1., self.W)
-        y_lin = torch.linspace(0., self.H - 1., self.H)
+        x_lin = torch.linspace(0.0, self.W - 1.0, self.W)
+        y_lin = torch.linspace(0.0, self.H - 1.0, self.H)
 
         grid_x, grid_y = torch.meshgrid(x_lin, y_lin)
         # meshgrid -> pytorch != tf :)
@@ -201,70 +219,31 @@ class VideoObjectSegmentationModel(nn.Module):
         y = torch.matmul(x, rep)
         y = torch.reshape(y, (-1,))
         return y
-
-    # https://github.com/daviddao/spatial-transformer-tensorflow/blob/master/spatial_transformer.py
+    
     def _interpolate(self, im, x, y, out_size):
         bs, c, h, w = im.shape
-
-        x = x.to(torch.float32)
-        y = y.to(torch.float32)
-        out_h = out_size[1]
-        out_w = out_size[2]
-        zero = torch.zeros([], dtype=torch.int32, device=self.device)
-        max_y = h - 1
-        max_x = w - 1
-
-        # sampling
-        x0 = torch.floor(x)
-        x0 = x0.to(torch.int32)
-        x0 = torch.clamp(x0, zero, max_x)
-        unclip_x1 = x0 + 1
-        x1 = torch.clamp(unclip_x1, zero, max_x)
-
-        y0 = torch.floor(y)
-        y0.to(torch.int32)
-        y0 = torch.clamp(y0, zero, max_y)
-        unclip_y1 = y0 + 1
-        y1 = torch.clamp(unclip_y1, zero, max_y)
-
-        dim2 = w
-        dim1 = w*h
-        z = torch.arange(0, bs, device=self.device)*dim1
-        base = self._repeat(z, out_h*out_w)
-        base_y0 = base + y0*dim2
-        base_y1 = base + y1*dim2
-        idx_a = base_y0 + x0
-        idx_b = base_y1 + x0
-        idx_c = base_y0 + x1
-        idx_d = base_y1 + x1
-
-        # use indices to lookup pixels in the flat image and restore
-        im_flat = torch.reshape(im, (-1, c))
-        im_flat = im_flat.to(torch.float32)
-        Ia = im_flat[idx_a.to(torch.long)]
-        Ib = im_flat[idx_b.to(torch.long)]
-        Ic = im_flat[idx_c.to(torch.long)]
-        Id = im_flat[idx_d.to(torch.long)]
-
-        # unclip_x1 = torch.clamp(unclip_x1, zero, max_x + 1)
-        # unclip_y1 = torch.clamp(unclip_y1, zero, max_y + 1)
-
-        x = torch.clamp(x, 0., float(max_x))
-        y = torch.clamp(y, 0., float(max_y))
-
-        # calculate interpolated values
-        x0_f = x0.to(torch.float32)
-        x1_f = x1.to(torch.float32)     # ?
-        y0_f = y0.to(torch.float32)
-        y1_f = y1.to(torch.float32)     # ?
-        wa = torch.unsqueeze((x1_f-x) * (y1_f-y), 1)
-        wb = torch.unsqueeze((x1_f-x) * (y-y0_f), 1)
-        wc = torch.unsqueeze((x-x0_f) * (y1_f-y), 1)
-        wd = torch.unsqueeze((x-x0_f) * (y-y0_f), 1)
-        output = wa*Ia + wb*Ib + wc*Ic + wd*Id
-
+        
+        # Normalize coordinates to [-1, 1]
+        x_normalized = 2.0 * x / (w - 1) - 1.0
+        y_normalized = 2.0 * y / (h - 1) - 1.0
+        
+        # Reshape to grid format
+        out_h, out_w = out_size[1], out_size[2]
+        grid_x = x_normalized.view(bs, out_h, out_w)
+        grid_y = y_normalized.view(bs, out_h, out_w)
+        
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+        
+        output = torch.nn.functional.grid_sample(
+            im, 
+            grid, 
+            mode='bilinear', 
+            padding_mode='border',
+            align_corners=True
+        )
+        
         return output
-    
+
     def vos_output_masks(self, model, x):
         return model.compute_masks(x)
 
@@ -273,87 +252,118 @@ class VideoObjectSegmentationModel(nn.Module):
         first_frames = torch.mean(x[:, :2, ...], 1)
         second_frames = torch.mean(x[:, 2:, ...], 1)
         s = torch.stack([first_frames, second_frames])
-        norm_s = s / 255.
+        norm_s = s / 255.0
         return norm_s.permute(1, 0, 2, 3)
 
-    
     def get_skill(self, device):
         model_path = "skills/torch_models/vid-obj-seg.pt"
-        
+
         model = VideoObjectSegmentationModel(device=device)
         state = torch.load(model_path, map_location=device)
         _ = model.load_state_dict(state, strict=True)
         model.eval()
         model.to(device)
-        
-        return Skill("vid_obj_seg", self.vid_obj_seg_input_trans, model, self.vos_output_masks, None)
-    
-    
-    
 
+        return Skill(
+            "vid_obj_seg",
+            self.vid_obj_seg_input_trans,
+            model,
+            self.vos_output_masks,
+            None,
+        )
 
 class VOSDataset():
-    def __init__(self, batch_size, num_frames, data_path, H=84, W=84):
+    def __init__(self, batch_size, num_frames, data_path, H=84, W=84, game=None, frame_skip=3):
         self.batch_size = batch_size
         self.num_frames = num_frames
+        self.frame_skip = frame_skip  # Sample every N frames for more motion
         self.H = H
         self.W = W
         self.data_path = data_path
         self.envs = os.listdir(self.data_path)
         self.episodes = {}
 
+        # NEW: cache for preloaded episodes
+        self.cache = {}
+
         for env in self.envs:
-          self.episode_paths = sorted(os.listdir(os.path.join(self.data_path, env)))
+            if game is not None and game.lower() not in env.lower():
+                continue
 
-          for episode_path in self.episode_paths:
-              self.episodes[env+"/"+episode_path] = sorted(
-                  glob.glob(os.path.join(self.data_path, env, episode_path, '*.png')),
-                  key=lambda x: int(os.path.basename(x).split('.')[0]),
-              )
+            episode_paths = sorted(os.listdir(os.path.join(self.data_path, env)))
 
+            for episode_path in episode_paths:
+                key = env + "/" + episode_path
+                frame_paths = sorted(
+                    glob.glob(os.path.join(self.data_path, env, episode_path, "*.png")),
+                    key=lambda x: int(os.path.basename(x).split('.')[0]),
+                )
 
+                if len(frame_paths) == 0:
+                    continue
 
+                self.episodes[key] = frame_paths
+
+                # -------- PRELOAD EPISODE INTO RAM --------
+                frames = []
+                for path in frame_paths:
+                    img = Image.open(path).convert("RGB")
+                    img_np = np.array(img)
+
+                    # RGB -> Grayscale
+                    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+                    # Resize
+                    resized = cv2.resize(
+                        gray, (self.W, self.H), interpolation=cv2.INTER_AREA
+                    )
+
+                    # Normalize to [0, 1]
+                    frames.append(resized.astype(np.float32) / 255.0)
+
+                # [T, H, W]
+                self.cache[key] = np.stack(frames, axis=0)
+
+        # Train / validation split (unchanged)
         all_episodes = sorted(
-            [key for key in self.episodes.keys() if 'episode_' in key],
-            key=lambda s: int(s.split('/')[-1].split('_')[-1])
+            [key for key in self.episodes.keys() if "episode_" in key],
+            key=lambda s: int(s.split("/")[-1].split("_")[-1])
         )
         split = int(0.8 * len(all_episodes))
         self.train_data_keys = all_episodes[:split]
         self.valid_data_keys = all_episodes[split:]
 
+        print(f"Loaded {len(self.cache)} episodes into RAM")
 
     def get_batch(self, data_type):
-      if data_type == "train":
-          episodes_keys = self.train_data_keys
-      else:
-          episodes_keys = self.valid_data_keys
+        if data_type == "train":
+            episode_keys = self.train_data_keys
+        else:
+            episode_keys = self.valid_data_keys
 
-      episodes = {k: self.episodes[k] for k in episodes_keys}
-      valid_keys = [k for k in episodes if len(episodes[k]) >= self.num_frames]
+        # Only episodes long enough
+        valid_keys = [
+            k for k in episode_keys
+            if self.cache[k].shape[0] >= (self.num_frames - 1) * self.frame_skip + 1
+        ]
 
-      frames = np.zeros([self.batch_size, self.num_frames, self.H, self.W], dtype=np.float32)
+        frames = np.zeros(
+            (self.batch_size, self.num_frames, self.H, self.W),
+            dtype=np.float32
+        )
 
-      for bs in range(self.batch_size):
-          k = np.random.choice(valid_keys)
-          f = episodes[k]
-          idx = random.randint(0, len(f) - self.num_frames)
+        for bs in range(self.batch_size):
+            k = np.random.choice(valid_keys)
+            episode = self.cache[k]
 
-          for j in range(self.num_frames):
-              path = f[idx + j]
+            max_start_idx = episode.shape[0] - (self.num_frames - 1) * self.frame_skip - 1
+            idx = random.randint(0, max_start_idx)
 
-              # Load image and preprocess: RGB -> Grayscale -> Resize -> Normalize
-              img = Image.open(path).convert('RGB')
-              img_np = np.array(img)
-
-              # Convert to grayscale
-              gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-
-              # Resize to (84, 84)
-              resized = cv2.resize(gray, (self.W, self.H), interpolation=cv2.INTER_AREA)
-
-              # Normalize to [0, 1] and add channel dimension
-              x = resized.astype(np.float32) / 255.0
-
-              frames[bs, j, :, :] = x  # (bs, num_frames, H, W)
-
-      return torch.from_numpy(frames).float()
+            # Sample frames with frame_skip spacing
+            for i in range(self.num_frames):
+                frames[bs, i] = episode[idx + i * self.frame_skip]
+        
+        if torch.cuda.is_available():
+            return torch.from_numpy(frames).pin_memory()
+        else:
+          return torch.from_numpy(frames)
