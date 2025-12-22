@@ -1,0 +1,7 @@
+prune tmp
+prune data
+prune agents
+prune skills
+prune eval_logs
+prune tensorboard_logs
+prune environment_configs

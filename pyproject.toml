@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ale-py>=0.11.2",
     "atariari",
+    "gym>=0.26.2",
     "gymnasium[atari]>=1.2.3",
     "huggingface-hub>=0.36.0",
     "huggingface-sb3>=3.0",
@@ -27,3 +28,21 @@ dependencies = [
 
 [tool.uv.sources]
 atariari = { git = "https://github.com/Sopralapanca/atari-representation-learning.git" }
+
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [
+    "tmp",
+    "data",
+    "agents",
+    "skills",
+    "eval_logs",
+    "tensorboard_logs",
+    "environment_configs",
+]
+

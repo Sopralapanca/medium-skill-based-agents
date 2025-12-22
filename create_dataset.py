@@ -39,7 +39,8 @@ if _config_path.exists():
 ENVS = _config.get("ENVS", [])
 
 
-EPISODES = _config.get("EPISODES", 10)
+#EPISODES = _config.get("EPISODES", 10)
+EPISODES = 10000
 MAX_STEPS_PER_EPISODE_RANDOM_AGENT = _config.get("MAX_STEPS_PER_EPISODE_RANDOM_AGENT", 100)
 MAX_STEPS_PER_EPISODE_EXPERT_AGENT = _config.get("MAX_STEPS_PER_EPISODE_EXPERT_AGENT", 100)
 BASE_DATA_PATH = _config.get("data_path", "./data")
@@ -76,32 +77,45 @@ class FrameCollector:
                 repo_id=f"sb3/ppo-{self.env_name}",
                 filename=f"ppo-{self.env_name}.zip",
             )
+        except Exception as e:
+            raise RuntimeError(f"Error downloading model for {self.env_name}: {e}")
 
-            # Some models saved with older SB3 / Python versions serialize
-            # callables (schedules / lambdas) that cannot be deserialized
-            # in newer runtimes (code object signature mismatch). Provide
-            # safe replacements via `custom_objects` to avoid those errors.
-            custom_objects = {
-                "learning_rate": 2.5e-4,
-                "lr_schedule": (lambda _: 2.5e-4),
-                "clip_range": (lambda _: 0.2),
-            }
-
-            try:
-                self.model = PPO.load(checkpoint, custom_objects=custom_objects)
-            except Exception as inner_e:
-                # If the full replacement fails, try a minimal replacement
-                # and if that still fails fall back to using a random agent.
-                print(f"Warning: full custom_objects load failed: {inner_e}")
-                try:
-                    self.model = PPO.load(checkpoint, custom_objects={"learning_rate": 2.5e-4})
-                except Exception as inner_e2:
-                    print(f"Error loading model after fallback: {inner_e2}")
-                    print("Falling back to standard loading")
-                    self.model = PPO.load(checkpoint)
+        custom_objects = {
+            "learning_rate": 2.5e-4,
+            "lr_schedule": (lambda _: 2.5e-4),
+            "clip_range": (lambda _: 0.2),
+        }
+        try:
+            self.model = PPO.load(checkpoint, custom_objects=custom_objects)
             return True
         except Exception as e:
             raise RuntimeError(f"Error loading model for {self.env_name}: {e}")
+
+        # Some models saved with older SB3 / Python versions serialize
+        # callables (schedules / lambdas) that cannot be deserialized
+        # in newer runtimes (code object signature mismatch). Provide
+        # safe replacements via `custom_objects` to avoid those errors.
+        # custom_objects = {
+        #     "learning_rate": 2.5e-4,
+        #     "lr_schedule": (lambda _: 2.5e-4),
+        #     "clip_range": (lambda _: 0.2),
+        # }
+
+        # try:
+        #     self.model = PPO.load(checkpoint, custom_objects=custom_objects)
+        # except Exception as inner_e:
+        #     # If the full replacement fails, try a minimal replacement
+        #     # and if that still fails fall back to using a random agent.
+        #     print(f"Warning: full custom_objects load failed: {inner_e}")
+        #     try:
+        #         self.model = PPO.load(checkpoint, custom_objects={"learning_rate": 2.5e-4})
+        #     except Exception as inner_e2:
+        #         print(f"Error loading model after fallback: {inner_e2}")
+        #         print("Falling back to standard loading")
+        #         self.model = PPO.load(checkpoint)
+        #     return True
+        # except Exception as e:
+        #     raise RuntimeError(f"Error loading model for {self.env_name}: {e}")
 
     def collect_frames_gameplay(self, n_episodes=3, max_steps_per_episode=1000, use_random_agent=False):
         print(f"Starting gameplay for {n_episodes} episodes...")
@@ -110,10 +124,15 @@ class FrameCollector:
         self.output_dir = os.path.join(self.base_path, self.env_name + suffix)
         os.makedirs(self.output_dir, exist_ok=True)
 
+        total_frames = 0 
         
         self.load_model()
 
         for episode in tqdm(range(n_episodes)):
+            if total_frames >= 20000:
+                print("Reached 20,000 frames, stopping collection.")
+                break
+            
             episode_dir = Path(self.output_dir) / f"episode_{episode + 1}"
             episode_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +169,7 @@ class FrameCollector:
                     frame_path = episode_dir / f"{step}.png"
                     img = Image.fromarray(frame)
                     img.save(frame_path)
+                    total_frames += 1
 
                 if hasattr(done, "__len__"):
                     if done[0]:
@@ -210,14 +230,14 @@ if __name__ == "__main__":
         print(f"Collecting frames for: {env}")
         collector = FrameCollector(env_name=env)
 
-        collector.collect_frames_gameplay(
-            n_episodes=EPISODES,
-            max_steps_per_episode=MAX_STEPS_PER_EPISODE_RANDOM_AGENT,
-            use_random_agent=True
-        )
-        
         # collector.collect_frames_gameplay(
         #     n_episodes=EPISODES,
-        #     max_steps_per_episode=MAX_STEPS_PER_EPISODE_EXPERT_AGENT,
-        #     use_random_agent=False
+        #     max_steps_per_episode=MAX_STEPS_PER_EPISODE_RANDOM_AGENT,
+        #     use_random_agent=True
         # )
+        
+        collector.collect_frames_gameplay(
+            n_episodes=EPISODES,
+            max_steps_per_episode=MAX_STEPS_PER_EPISODE_EXPERT_AGENT,
+            use_random_agent=False
+        )

@@ -97,9 +97,7 @@ class RefineNet(nn.Module):
             nn.Conv2d(32, 32, 3, 1, 1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(32, num_ch, 7, 1, 3),
-            nn.BatchNorm2d(num_ch),
-            nn.ReLU()
+            nn.Conv2d(32, num_ch, 7, 1, 3)
         )
 
     def forward(self, inp):
@@ -144,17 +142,22 @@ def gaussian_map(features, std=0.2):
     return g_yx
 
 def transport(source_keypoints, target_keypoints, source_features, target_features):
-    out = source_features
-    for s, t in zip(torch.unbind(source_keypoints, 1), torch.unbind(target_keypoints, 1)):
-        out = (1 - s.unsqueeze(1)) * (1 - t.unsqueeze(1)) * out + t.unsqueeze(1) * target_features
+    # source_keypoints: (N, K, H, W)
+    # target_keypoints: (N, K, H, W)
+    # Paper equation (1): Φ̂ = (1−HΨ(xs))·(1−HΨ(xt))·Φ(xs) + HΨ(xt)·Φ(xt)
+    # Use max to combine keypoints - preserves gradients better than sum+clamp
+    S_mask, _ = source_keypoints.max(dim=1, keepdim=True)  # (N, 1, H, W)
+    T_mask, _ = target_keypoints.max(dim=1, keepdim=True)  # (N, 1, H, W)
+    
+    out = (1 - S_mask) * (1 - T_mask) * source_features + T_mask * target_features
     return out
 
 class Transporter(nn.Module):
-    def __init__(self, std=0.1):
+    def __init__(self, inp_ch=1, K=4, std=0.2):
         super().__init__()
-        self.encoder = Encoder(inp_ch=1)
-        self.key_net = KeyNet(inp_ch=1, K=4)
-        self.refine_net = RefineNet(num_ch=1)
+        self.encoder = Encoder(inp_ch=inp_ch)
+        self.key_net = KeyNet(inp_ch=inp_ch, K=K)
+        self.refine_net = RefineNet(num_ch=inp_ch)
         self.std = std
         
     def forward(self, source_img, target_img):
@@ -170,8 +173,8 @@ class Transporter(nn.Module):
         target_kn = spatial_softmax(target_kn)
         target_keypoints = gaussian_map(target_kn, self.std)
 
-        # transport
-        transport_features = transport(source_keypoints.detach(),
+        # transport - only detach source_features per paper
+        transport_features = transport(source_keypoints,
                                     target_keypoints,
                                     source_features.detach(),
                                     target_features)
@@ -201,11 +204,11 @@ class Transporter(nn.Module):
 
 
 class ObjectKeypointsDataset(Dataset):
-    def __init__(self, path, ep=10, transform=None):
+    def __init__(self, path, transform=None, game=None):
         super().__init__()
         self.path = path
         self.transform = transform
-        self.ep = ep
+        self.game = game
 
         # PRE-CACHE directory structure to avoid repeated os.listdir() calls
         self.envs = os.listdir(self.path)
@@ -213,7 +216,12 @@ class ObjectKeypointsDataset(Dataset):
 
         print("Caching episode lengths...")
         for env in self.envs:
+            if self.game is not None and self.game.lower() not in env.lower():
+                continue
+            
             env_path = f"{self.path}/{env}"
+            ep = len(os.listdir(env_path))
+            
             for n in range(1, ep + 1):
                 ep_path = f"{env_path}/episode_{n}"
                 if os.path.exists(ep_path):
@@ -227,24 +235,41 @@ class ObjectKeypointsDataset(Dataset):
     def __getitem__(self, index):
         n, env, t, tp1 = index
 
-        imgt = Image.open(f"{self.path}/{env}/episode_{n}/{t}.png")
-        imgtp1 = Image.open(f"{self.path}/{env}/episode_{n}/{tp1}.png")
+        # imgt = Image.open(f"{self.path}/{env}/episode_{n}/{t}.png")
+        # imgtp1 = Image.open(f"{self.path}/{env}/episode_{n}/{tp1}.png")
 
-        if self.transform is not None:
-            imgt = self.transform(imgt)
-            imgtp1 = self.transform(imgtp1)
+        # if self.transform is not None:
+        #     imgt = self.transform(imgt)
+        #     imgtp1 = self.transform(imgtp1)
+        
+        imgt = torch.load(f"{self.path}/{env}/episode_{n}/{t}.pt")
+        imgtp1 = torch.load(f"{self.path}/{env}/episode_{n}/{tp1}.pt")
 
         return imgt, imgtp1
 
     def get_trajectory(self, env, idx):
+        full_path = f"{self.path}/{env}/episode_{idx}"
+        if not os.path.exists(full_path):
+            raise ValueError(f"Episode {idx} not found in environment {env}.")
+
         max_ep_len = self.episode_lengths.get((env, idx), 0)
-        images = [Image.open(f'{self.path}/{env}/episode_{idx}/{t}.png')
-                  for t in range(max_ep_len)]
-        return [self.transform(im) for im in images]
+
+        if max_ep_len == 0:
+            raise ValueError(f"Episode {idx} has no frames in environment {env}.")
+        
+        # images = [Image.open(f'{full_path}/{t}.png')
+        #           for t in range(max_ep_len)]
+        
+        # return [self.transform(im) for im in images]
+        
+        return [
+            torch.load(f"{self.path}/{env}/episode_{idx}/{t}.pt")
+            for t in range(max_ep_len)
+        ]
 
 
 class ObjectKeypointsSampler(Sampler):
-    def __init__(self, dataset, cache_size=10000):
+    def __init__(self, dataset: ObjectKeypointsDataset, cache_size=10000):
         self.dataset = dataset
         self.envs = os.listdir(self.dataset.path)
         self.cache_size = cache_size
@@ -253,8 +278,13 @@ class ObjectKeypointsSampler(Sampler):
         print("Building episode metadata cache...")
         self.episode_metadata = []
         for env in self.envs:
+            if self.dataset.game is not None and self.dataset.game.lower() not in env.lower():
+                continue
+            
             env_path = os.path.join(self.dataset.path, env)
-            for n in range(1, self.dataset.ep + 1):
+            ep = len(os.listdir(env_path))
+            
+            for n in range(1, ep + 1):
                 episode_path = os.path.join(env_path, f"episode_{n}")
                 if os.path.exists(episode_path):
                     num_images = len(os.listdir(episode_path))
@@ -266,6 +296,7 @@ class ObjectKeypointsSampler(Sampler):
                         })
         if len(self.episode_metadata) == 0:
             raise ValueError("No valid episodes found in the dataset path. All episodes must have at least 21 frames.")
+        
         print(f"Cached {len(self.episode_metadata)} valid episodes")
         self._generate_samples()
 
