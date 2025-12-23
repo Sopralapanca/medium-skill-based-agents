@@ -20,8 +20,8 @@ if config_path.exists():
 
 data_path = config.get("data_path", "./data")
 img_sz = config.get("IMG_SZ", 84)
-batch_size = config.get("batch_size", 32)
-max_training_steps = config.get("max_training_steps", 500)
+batch_size = 64
+max_training_steps = 250000
 
 os.makedirs('./skills/torch_models', exist_ok=True)
 
@@ -66,14 +66,16 @@ def main():
     
     # Create datasets and dataloaders
     dataset_ts = AutoencoderDataset(episode_paths, train_idxs, img_sz)
-    train_load = DataLoader(dataset_ts, batch_size, shuffle=True)
+    train_load = DataLoader(dataset_ts, batch_size, shuffle=True, pin_memory=True)
 
     dataset_vs = AutoencoderDataset(episode_paths, val_idxs, img_sz)
-    val_load = DataLoader(dataset_vs, batch_size, shuffle=False)
+    val_load = DataLoader(dataset_vs, batch_size, shuffle=False, pin_memory=True)
 
     # Initialize model
     channels = 1  # Set to 3 if using RGB images
     autoencoder = Autoencoder(channels=channels).to(device)
+    autoencoder = torch.compile(autoencoder, mode='default')
+    
     criterion = nn.MSELoss().cuda() if torch.cuda.is_available() else nn.MSELoss()
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-3)
 
@@ -81,6 +83,8 @@ def main():
 
     # Training loop with tqdm
     best_loss = float('inf')
+    eval_interval = 2000  # run validation every N outer steps (epochs)
+    last_val_loss = float('nan')
     
     pbar = tqdm(range(max_training_steps), desc="AE Training", unit="epochs")
     at_step = 0
@@ -100,29 +104,32 @@ def main():
 
         avg_train_loss = sum(train_losses) / len(train_losses) if len(train_losses) > 0 else 0.0
 
-        # validation
-        val_losses = []
-        with torch.no_grad():
-            autoencoder.eval()
-            for i, imgs in enumerate(val_load):
-                imgs = imgs.to(device)
-                out = autoencoder(imgs)
-                vloss = criterion(out, imgs)
-                val_losses.append(vloss.detach().cpu().item())
+        # validation only every `eval_interval` steps
+        avg_val_loss = last_val_loss
+        if (epoch + 1) % eval_interval == 0:
+            val_losses = []
+            with torch.no_grad():
+                autoencoder.eval()
+                for i, imgs in enumerate(val_load):
+                    imgs = imgs.to(device)
+                    out = autoencoder(imgs)
+                    vloss = criterion(out, imgs)
+                    val_losses.append(vloss.detach().cpu().item())
 
-        avg_val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else 0.0
+            avg_val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else float('nan')
+            last_val_loss = avg_val_loss
+
+            # Save best model when validation improves
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                at_step = epoch + 1
+                torch.save(autoencoder.state_dict(), './skills/torch_models/nature-encoder.pt')
 
         # Convert to tensors so .item() is available in postfix formatting as requested
         tr_loss = torch.tensor(avg_train_loss)
         val_loss = torch.tensor(avg_val_loss)
         best_val_loss = best_loss
-    
-        # Save best model
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
-            at_step = epoch + 1
-            torch.save(autoencoder.state_dict(), './skills/torch_models/nature-encoder.pt')
-            
+
         pbar.set_postfix({
             'tr_loss': f'{tr_loss.item():.5f}',
             'val_loss': f'{val_loss.item():.5f}',
@@ -132,10 +139,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # On Windows, multiprocessing with spawn requires freeze_support
-    try:
-        from multiprocessing import freeze_support
-        freeze_support()
-    except Exception:
-        pass
     main()

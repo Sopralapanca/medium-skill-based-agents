@@ -35,7 +35,7 @@ random.shuffle(all_tr_eps)
 random.shuffle(all_val_eps)
 
 state_rep_model = UnsupervisedStateRepresentationModel(
-    observation=all_tr_eps[0][0], max_training_steps=max_training_steps, device=device
+    observation=all_tr_eps[0][0], max_training_steps=max_training_steps, device=device, batch_size=128
 )
 
-state_rep_model.train(all_tr_eps, all_val_eps)
+state_rep_model.train(all_tr_eps, all_val_eps, val_interval=5)

@@ -20,7 +20,7 @@ def _get_episodes(env_name, steps, collect_mode):
     return tr_eps, val_eps
     
 class UnsupervisedStateRepresentationModel:
-    def __init__(self, observation, max_training_steps=10000, device=None):
+    def __init__(self, observation, device, max_training_steps=10000, batch_size=64, patience=7):
                 
         dummy_wandb = DummyWandB()
         args = {
@@ -31,9 +31,9 @@ class UnsupervisedStateRepresentationModel:
             "feature_size": 512,
             "end_with_relu": True,
             "encoder_type": "Nature",
-            "patience": 15,
+            "patience": patience,
             "epochs": 100,
-            "batch_size": 64,
+            "batch_size": batch_size,
             "lr": 3e-4,
             "method": "vae",
             "end_with_relu": False,
@@ -45,6 +45,8 @@ class UnsupervisedStateRepresentationModel:
         self.observation_shape = observation.shape # (1, 210, 160)
     
         self.encoder = NatureCNN(input_channels=self.observation_shape[0], args=self.args).to(device)
+        self.encoder = torch.compile(self.encoder, mode='default')
+
 
         config = {}
         config.update(vars(self.args))
@@ -54,8 +56,8 @@ class UnsupervisedStateRepresentationModel:
             self.encoder, config, device=device, wandb=dummy_wandb
         )
         
-    def train(self, train_episodes, val_episodes):
-        self.trainer.train(train_episodes, val_episodes)
+    def train(self, train_episodes, val_episodes, val_interval=5):
+        self.trainer.train(train_episodes, val_episodes, val_interval=val_interval)
         
         os.makedirs('./skills/torch_models/', exist_ok=True)
         torch.save(self.encoder.state_dict(), './skills/torch_models/state-rep.pt')
