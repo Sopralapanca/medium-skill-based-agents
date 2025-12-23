@@ -128,8 +128,9 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
             self.mlp_layers.append(seq_layer)
 
         # linear layer for context in the attention
-        model_path = "skills/torch_models/nature-encoder.pt"
+        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
         model = Autoencoder().to(device)
+        model = torch.compile(model, mode='default')
         model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
         model.eval()
 
