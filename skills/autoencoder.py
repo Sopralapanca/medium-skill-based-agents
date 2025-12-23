@@ -38,7 +38,7 @@ class Autoencoder(nn.Module):
         return x.float()
 
     def get_skill(self, device):
-        model_path = "skills/torch_models/nature-encoder.pt"
+        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
 
         self.load_state_dict(torch.load(model_path, map_location=device), strict=True)
         self.to(device)

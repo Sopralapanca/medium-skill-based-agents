@@ -256,9 +256,11 @@ class VideoObjectSegmentationModel(nn.Module):
         return norm_s.permute(1, 0, 2, 3)
 
     def get_skill(self, device):
-        model_path = "skills/torch_models/vid-obj-seg.pt"
+        model_path = "skills/torch_models/vid-obj-seg-all-envs.pt"
 
         model = VideoObjectSegmentationModel(device=device)
+        model = torch.compile(model, mode='default')
+        
         state = torch.load(model_path, map_location=device)
         _ = model.load_state_dict(state, strict=True)
         model.eval()

@@ -186,7 +186,7 @@ class Transporter(nn.Module):
     def get_skill(self, device, keynet_or_encoder='encoder'):
         input_transformation_function = obj_key_input_trans
         # here I should load the .pt model
-        model_path = "skills/torch_models/vid-obj-key.pt"
+        model_path = "skills/torch_models/vid-obj-key-all-envs.pt"
         
         model = Transporter(std=self.std)
         state = torch.load(model_path, map_location=device)

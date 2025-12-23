@@ -75,9 +75,11 @@ class UnsupervisedStateRepresentationModel:
     
     def get_skill(self, device):
         input_transformation_function = self.state_rep_input_trans
-        model_path = "skills/torch_models/state-rep.pt"
+        model_path = "skills/torch_models/state-rep-all-envs.pt"
 
         model = NatureCNNEncoder(input_channels=1, feature_size=512).to(device)
+        model = torch.compile(model, mode='default')
+        
         model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
         model.eval()
         adapter = None
