@@ -207,3 +207,134 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         att_out = weights * stacked_skills
         att_out = torch.sum(att_out, 1)
         return att_out
+
+
+class MixtureOfExpertsExtractor(FeaturesExtractor):
+    def __init__(
+        self, 
+        observation_space: spaces.Box,
+        features_dim: int = 256,
+        skills: List[Skill] | None = None,
+        device="cpu",
+        top_k: int = 2,  # number of experts to activate
+    ):
+        """
+        Mixture of Experts feature extractor that selectively activates only top-k skills based on router decision.
+        
+        :param observation_space: Gymnasium observation space
+        :param features_dim: Number of features extracted from the observations
+        :param skills: List of skill objects (experts)
+        :param device: Device used for computation
+        :param top_k: Number of top experts to activate (default: 2)
+        """
+        super().__init__(observation_space, features_dim, skills, device)
+
+        self.device = device
+        self.top_k = min(top_k, len(skills)) if skills else top_k
+        
+        sample = observation_space.sample()  # 4x84x84
+        sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
+        sample = torch.from_numpy(sample) / 255
+        sample = sample.to(device)
+
+        # Context encoder for routing decisions
+        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
+        model = Autoencoder().to(device)
+        model = torch.compile(model, mode='default')
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
+        model.eval()
+        self.encoder = model.encoder
+        
+        z = self.get_last_frame_embedding_for_context(sample)    
+        self.input_size = z.shape[-1]
+
+        # Router network: takes context and outputs logits for each expert
+        self.router = nn.Sequential(
+            nn.Linear(self.input_size, features_dim, device=device),
+            nn.ReLU(),
+            nn.Linear(features_dim, len(self.skills), device=device)
+        )
+
+        # MLP layers for each skill to project to features_dim
+        self.preprocess_input(sample)  # populate self.skills_embeddings
+        
+        self.mlp_layers = nn.ModuleList()
+        for i in range(len(self.skills_embeddings)):
+            seq_layer = nn.Sequential(
+                nn.Linear(self.skills_embeddings[i].shape[1], features_dim, device=device),
+                nn.ReLU(),
+            )
+            self.mlp_layers.append(seq_layer)
+
+        # Tracking
+        self.expert_weights = {}
+        self.selected_experts = []
+        self.training_weights = []
+
+    def get_last_frame_embedding_for_context(self, observations: torch.Tensor) -> torch.Tensor:
+        """Extract context from the last frame for routing decisions"""
+        x = observations[:, -1:, :, :]
+        with torch.no_grad():
+            z = self.encoder(x)
+            z = torch.reshape(z, (z.size(0), -1))
+        return z
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        batch_size = observations.shape[0]
+        
+        # Get context for routing
+        context = self.get_last_frame_embedding_for_context(observations)
+        
+        # Router outputs logits for each expert
+        router_logits = self.router(context)  # (batch_size, num_experts)
+        
+        # Get top-k experts
+        top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
+        
+        # Normalize weights using softmax only over selected experts
+        top_k_weights = torch.softmax(top_k_values, dim=1)  # (batch_size, top_k)
+        
+        # Initialize output
+        output = torch.zeros(batch_size, self.features_dim, device=self.device)
+        
+        # Store weights for tracking
+        all_weights = torch.zeros(batch_size, len(self.skills), device=self.device)
+        
+        # Process only the selected experts
+        for batch_idx in range(batch_size):
+            for k_idx in range(self.top_k):
+                expert_idx = top_k_indices[batch_idx, k_idx].item()
+                weight = top_k_weights[batch_idx, k_idx]
+                
+                # Store weight
+                all_weights[batch_idx, expert_idx] = weight
+                
+                # Apply skill only if not already computed for this batch
+                skill = self.skills[expert_idx]
+                obs_single = observations[batch_idx:batch_idx+1]
+                
+                with torch.no_grad():
+                    so = skill.input_adapter(obs_single)
+                    so = skill.skill_output(skill.skill_model, so)
+                
+                # Apply adapter if needed
+                if skill.name in self.adapters:
+                    adapter = self.adapters[skill.name]
+                    so = adapter(so)
+                
+                # Flatten to linear embedding
+                if len(so.shape) > 2:
+                    so = torch.reshape(so, (so.size(0), -1))
+                
+                # Project through MLP
+                so = self.mlp_layers[expert_idx](so)
+                
+                # Weighted sum
+                output[batch_idx] += weight * so.squeeze(0)
+        
+        # Store weights for visualization
+        self.training_weights.append(all_weights.detach().cpu().numpy())
+        for i, skill in enumerate(self.skills):
+            self.expert_weights[skill.name] = all_weights[:, i].detach().cpu().tolist()
+        
+        return output
