@@ -61,13 +61,18 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         #     if el.ndim == 4:
         #         self.num_channels += el.shape[1]
 
-    def preprocess_input(self, observations: torch.Tensor):
+    def preprocess_input(self, observations: torch.Tensor, skill_indices: List[int] = None):
         """
         :param observations: torch tensor of shape (n_envs, n_stacked_frames, height, width)
+        :param skill_indices: list of skill indices to process (None = process all skills)
         """
         self.skills_embeddings = []
 
-        for skill in self.skills:
+        # If skill_indices not provided, process all skills (for WSA compatibility)
+        skills_to_process = skill_indices if skill_indices is not None else range(len(self.skills))
+
+        for idx in skills_to_process:
+            skill = self.skills[idx]
             # this apply a skill to the observations
             with torch.no_grad():
                 so = skill.input_adapter(observations)
@@ -288,49 +293,38 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         # Router outputs logits for each expert
         router_logits = self.router(context)  # (batch_size, num_experts)
         
-        # Get top-k experts
+        # Get top-k experts per sample
         top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
         
         # Normalize weights using softmax only over selected experts
         top_k_weights = torch.softmax(top_k_values, dim=1)  # (batch_size, top_k)
         
-        # Initialize output
+        # Store weights for tracking (sparse representation)
+        all_weights = torch.zeros(batch_size, len(self.skills), device=self.device)
+        all_weights.scatter_(1, top_k_indices, top_k_weights)
+        
+        # Find unique experts selected across the entire batch
+        unique_experts = torch.unique(top_k_indices).tolist()
+        
+        # Process all unique experts for the ENTIRE batch at once using preprocess_input
+        self.preprocess_input(observations, skill_indices=unique_experts)
+        
+        # Now combine expert outputs using per-sample weights
         output = torch.zeros(batch_size, self.features_dim, device=self.device)
         
-        # Store weights for tracking
-        all_weights = torch.zeros(batch_size, len(self.skills), device=self.device)
-        
-        # Process only the selected experts
-        for batch_idx in range(batch_size):
-            for k_idx in range(self.top_k):
-                expert_idx = top_k_indices[batch_idx, k_idx].item()
-                weight = top_k_weights[batch_idx, k_idx]
-                
-                # Store weight
-                all_weights[batch_idx, expert_idx] = weight
-                
-                # Apply skill only if not already computed for this batch
-                skill = self.skills[expert_idx]
-                obs_single = observations[batch_idx:batch_idx+1]
-                
-                with torch.no_grad():
-                    so = skill.input_adapter(obs_single)
-                    so = skill.skill_output(skill.skill_model, so)
-                
-                # Apply adapter if needed
-                if skill.name in self.adapters:
-                    adapter = self.adapters[skill.name]
-                    so = adapter(so)
-                
-                # Flatten to linear embedding
-                if len(so.shape) > 2:
-                    so = torch.reshape(so, (so.size(0), -1))
-                
-                # Project through MLP
-                so = self.mlp_layers[expert_idx](so)
-                
-                # Weighted sum
-                output[batch_idx] += weight * so.squeeze(0)
+        for i, expert_idx in enumerate(unique_experts):
+            # Get the skill embedding for all samples (already computed)
+            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
+            
+            # Project through MLP (trainable)
+            skill_embedding = self.mlp_layers[expert_idx](skill_embedding)  # (batch_size, features_dim)
+            
+            # Get per-sample weights for this expert
+            expert_weights = all_weights[:, expert_idx]  # (batch_size,)
+            
+            # Weight and accumulate
+            weighted_output = skill_embedding * expert_weights.unsqueeze(1)  # (batch_size, features_dim)
+            output += weighted_output
         
         # Store weights for visualization
         self.training_weights.append(all_weights.detach().cpu().numpy())
