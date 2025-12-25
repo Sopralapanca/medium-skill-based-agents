@@ -72,19 +72,23 @@ environment_configuration["game"] = env
 # monitor_dir = f"monitor/{run.id}"
 monitor_dir = "ppo"
 
-vec_envs = make_atari_env(env, n_envs=environment_configuration["n_envs"], seed=seed)
-vec_envs = VecFrameStack(vec_envs, n_stack=environment_configuration["n_stacks"])
-vec_envs = VecTransposeImage(vec_envs)
+# Create a short-lived env to collect an observation for skill initialization,
+# then close it. Training environments will be created per-agent inside the loop.
+temp_envs = make_atari_env(env, n_envs=environment_configuration["n_envs"], seed=seed)
+temp_envs = VecFrameStack(temp_envs, n_stack=environment_configuration["n_stacks"])
+temp_envs = VecTransposeImage(temp_envs)
 
-# execute some steps with random moves
-obs = vec_envs.reset()
-
+# execute some steps with random moves to get a representative observation
+obs = temp_envs.reset()
 for i in range(10):
-    action = [vec_envs.action_space.sample() for _ in range(environment_configuration["n_envs"])]
-    obs, rewards, dones, info = vec_envs.step(action)
+    action = [temp_envs.action_space.sample() for _ in range(environment_configuration["n_envs"])]
+    obs, rewards, dones, info = temp_envs.step(action)
 
 # obs[0] has shape (4, 84, 84) because there are 4 stacked environments, take the first
 observation = obs[0][-1]
+
+# Close the temporary envs - we'll create fresh envs per run below
+temp_envs.close()
 
 
 # init skills
@@ -151,6 +155,11 @@ for feature_extractor_class in ["ppo", "wsa", "moe"]:
 
     logdir = "./tensorboard_logs"
 
+    # create a fresh training env for this run (do not reuse)
+    vec_envs = make_atari_env(env, n_envs=environment_configuration["n_envs"], seed=seed)
+    vec_envs = VecFrameStack(vec_envs, n_stack=environment_configuration["n_stacks"])
+    vec_envs = VecTransposeImage(vec_envs)
+
     model = PPO(
         "CnnPolicy",
         vec_envs,
@@ -195,4 +204,13 @@ for feature_extractor_class in ["ppo", "wsa", "moe"]:
     ]
 
     model.learn(2000, callback=callbacks) #tb_log_name=run.id)
+    # close environments to avoid state leakage between runs
+    try:
+        vec_envs.close()
+    except Exception:
+        pass
+    try:
+        eval_env.close()
+    except Exception:
+        pass
     #run.finish()
