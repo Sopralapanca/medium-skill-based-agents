@@ -259,11 +259,17 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         z = self.get_last_frame_embedding_for_context(sample)    
         self.input_size = z.shape[-1]
 
-        # Router network: takes context and outputs logits for each expert
+        # Router network: takes context and outputs logits for each expert (Stage 1: Selection)
         self.router = nn.Sequential(
             nn.Linear(self.input_size, features_dim, device=device),
             nn.ReLU(),
             nn.Linear(features_dim, len(self.skills), device=device)
+        )
+
+        # Context encoder for weight refinement (Stage 2)
+        self.encoder_lin_layer = nn.Sequential(
+            nn.Linear(self.input_size, features_dim, device=device),
+            nn.ReLU(),
         )
 
         # MLP layers for each skill to project to features_dim
@@ -276,6 +282,13 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
                 nn.ReLU(),
             )
             self.mlp_layers.append(seq_layer)
+
+        # Weight refinement MLP (Stage 2: Refinement)
+        # Takes concatenated [context, skill_embedding] and outputs weight for that skill
+        self.weight_refiner = nn.Sequential(
+            nn.Linear(2 * features_dim, 1, device=device),
+            nn.ReLU()
+        )
 
         # Tracking
         self.expert_weights = {}
@@ -293,64 +306,86 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         batch_size = observations.shape[0]
         
-        # Get context for routing
-        context = self.get_last_frame_embedding_for_context(observations)
         
+        # Get context for routing and weight refinement
+        context_raw = self.get_last_frame_embedding_for_context(observations)
+        
+        # ========== STAGE 1: Expert Selection (Router) ==========
         # Router outputs logits for each expert
-        router_logits = self.router(context)  # (batch_size, num_experts)
+        router_logits = self.router(context_raw)  # (batch_size, num_experts)
         
         # Add noise during training for exploration
         if self.training and self.router_noise > 0:
             noise = torch.randn_like(router_logits) * self.router_noise
             router_logits = router_logits + noise
         
-        if self.use_soft_routing:
-            # Soft routing: compute weights over all experts but process only top-k
-            # This allows gradients to flow to all experts through the softmax
-            all_weights = torch.softmax(router_logits, dim=1)  # (batch_size, num_experts)
-            
-            # Get top-k indices for efficiency (only process these experts)
-            _, top_k_indices = torch.topk(all_weights, self.top_k, dim=1)
-            
-            # Use the original softmax weights (no renormalization)
-            # This maintains proper gradient flow
-            weights_to_use = all_weights
-        else:
-            # Hard routing (original): only top-k get non-zero weights
-            top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
-            top_k_weights = torch.softmax(top_k_values, dim=1)
-            
-            weights_to_use = torch.zeros(batch_size, len(self.skills), device=self.device)
-            weights_to_use.scatter_(1, top_k_indices, top_k_weights)
+        # Select top-k experts per sample
+        # Shape: (batch_size, top_k)
+        _, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
         
-        # Find unique experts selected across the entire batch
+        # Find unique experts selected across the entire batch for efficient inference
         unique_experts = torch.unique(top_k_indices).tolist()
         
+        # ========== Process Selected Experts (Batch-wise) ==========
         # Process all unique experts for the ENTIRE batch at once using preprocess_input
         self.preprocess_input(observations, skill_indices=unique_experts)
         
-        # Now combine expert outputs using per-sample weights
+        # Project skill embeddings through their respective MLPs
+        # Create mapping from expert_idx to position in skills_embeddings
+        expert_to_embedding = {}
+        for i, expert_idx in enumerate(unique_experts):
+            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
+            skill_embedding = self.mlp_layers[expert_idx](skill_embedding)  # (batch_size, features_dim)
+            expert_to_embedding[expert_idx] = skill_embedding
+        
+        # ========== STAGE 2: Weight Refinement ==========
+        # Process context through linear layer for refinement
+        context_encoded = self.encoder_lin_layer(context_raw)  # (batch_size, features_dim)
+        
+        # Compute weights for all selected experts (batch-wise, like WSA)
+        weight_logits = []
+        for expert_idx in unique_experts:
+            # Concatenate context with skill embedding for ALL samples in batch
+            concatenated = torch.cat([context_encoded, expert_to_embedding[expert_idx]], dim=1)  # (batch_size, 2*features_dim)
+            weight_logit = self.weight_refiner(concatenated)  # (batch_size, 1)
+            weight_logits.append(weight_logit)
+        
+        # Stack weights: (batch_size, num_unique_experts)
+        weight_logits = torch.cat(weight_logits, dim=1)
+        
+        # Create mask for selected experts per sample
+        # Initialize with -inf so unselected experts get zero weight after softmax
+        refined_logits = torch.full((batch_size, len(self.skills)), float('-inf'), device=self.device)
+        
+        # Fill in logits for selected experts
+        for i, expert_idx in enumerate(unique_experts):
+            refined_logits[:, expert_idx] = weight_logits[:, i]
+        
+        # Mask out experts that weren't selected by each sample
+        # Create a mask: (batch_size, num_experts)
+        expert_mask = torch.zeros(batch_size, len(self.skills), dtype=torch.bool, device=self.device)
+        expert_mask.scatter_(1, top_k_indices, True)
+        
+        # Set non-selected experts to -inf
+        refined_logits[~expert_mask] = float('-inf')
+        
+        # Softmax per sample over selected experts (ensures weights sum to 1.0)
+        refined_weights = torch.softmax(refined_logits, dim=1)  # (batch_size, num_experts)
+        
+        # ========== Combine Expert Outputs ==========
         output = torch.zeros(batch_size, self.features_dim, device=self.device)
         
-        # CRITICAL FIX: skills_embeddings is indexed by order of unique_experts, not by expert_idx!
-        for i, expert_idx in enumerate(unique_experts):
-            # Get the skill embedding at position i in skills_embeddings
-            # (this corresponds to expert_idx in the original skills list)
-            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
-            
-            # Project through the correct MLP for this expert
-            skill_embedding = self.mlp_layers[expert_idx](skill_embedding)  # (batch_size, features_dim)
-            
-            # Get per-sample weights for this expert from the weight matrix
-            expert_weights = weights_to_use[:, expert_idx]  # (batch_size,)
+        for expert_idx in unique_experts:
+            skill_embedding = expert_to_embedding[expert_idx]  # (batch_size, features_dim)
+            expert_weights = refined_weights[:, expert_idx]  # (batch_size,)
             
             # Weight and accumulate
             weighted_output = skill_embedding * expert_weights.unsqueeze(1)  # (batch_size, features_dim)
             output += weighted_output
         
         # Store weights for visualization
-        self.training_weights.append(weights_to_use.detach().cpu().numpy())
+        self.training_weights.append(refined_weights.detach().cpu().numpy())
         for i, skill in enumerate(self.skills):
-            self.expert_weights[skill.name] = weights_to_use[:, i].detach().cpu().tolist()
+            self.expert_weights[skill.name] = refined_weights[:, i].detach().cpu().tolist()
         
         return output
