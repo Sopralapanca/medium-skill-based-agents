@@ -222,6 +222,8 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         skills: List[Skill] | None = None,
         device="cpu",
         top_k: int = 2,  # number of experts to activate
+        use_soft_routing: bool = True,  # use soft routing for better gradients
+        router_noise: float = 0.1,  # noise std for exploration during training
     ):
         """
         Mixture of Experts feature extractor that selectively activates only top-k skills based on router decision.
@@ -231,11 +233,15 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         :param skills: List of skill objects (experts)
         :param device: Device used for computation
         :param top_k: Number of top experts to activate (default: 2)
+        :param use_soft_routing: If True, use soft top-k for gradient flow (default: True)
+        :param router_noise: Standard deviation of noise added to router logits during training
         """
         super().__init__(observation_space, features_dim, skills, device)
 
         self.device = device
         self.top_k = min(top_k, len(skills)) if skills else top_k
+        self.use_soft_routing = use_soft_routing
+        self.router_noise = router_noise
         
         sample = observation_space.sample()  # 4x84x84
         sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
@@ -293,15 +299,29 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         # Router outputs logits for each expert
         router_logits = self.router(context)  # (batch_size, num_experts)
         
-        # Get top-k experts per sample
-        top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
+        # Add noise during training for exploration
+        if self.training and self.router_noise > 0:
+            noise = torch.randn_like(router_logits) * self.router_noise
+            router_logits = router_logits + noise
         
-        # Normalize weights using softmax only over selected experts
-        top_k_weights = torch.softmax(top_k_values, dim=1)  # (batch_size, top_k)
-        
-        # Store weights for tracking (sparse representation)
-        all_weights = torch.zeros(batch_size, len(self.skills), device=self.device)
-        all_weights.scatter_(1, top_k_indices, top_k_weights)
+        if self.use_soft_routing:
+            # Soft routing: compute weights over all experts but process only top-k
+            # This allows gradients to flow to all experts through the softmax
+            all_weights = torch.softmax(router_logits, dim=1)  # (batch_size, num_experts)
+            
+            # Get top-k indices for efficiency (only process these experts)
+            _, top_k_indices = torch.topk(all_weights, self.top_k, dim=1)
+            
+            # Use the original softmax weights (no renormalization)
+            # This maintains proper gradient flow
+            weights_to_use = all_weights
+        else:
+            # Hard routing (original): only top-k get non-zero weights
+            top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
+            top_k_weights = torch.softmax(top_k_values, dim=1)
+            
+            weights_to_use = torch.zeros(batch_size, len(self.skills), device=self.device)
+            weights_to_use.scatter_(1, top_k_indices, top_k_weights)
         
         # Find unique experts selected across the entire batch
         unique_experts = torch.unique(top_k_indices).tolist()
@@ -312,23 +332,25 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         # Now combine expert outputs using per-sample weights
         output = torch.zeros(batch_size, self.features_dim, device=self.device)
         
+        # CRITICAL FIX: skills_embeddings is indexed by order of unique_experts, not by expert_idx!
         for i, expert_idx in enumerate(unique_experts):
-            # Get the skill embedding for all samples (already computed)
+            # Get the skill embedding at position i in skills_embeddings
+            # (this corresponds to expert_idx in the original skills list)
             skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
             
-            # Project through MLP (trainable)
+            # Project through the correct MLP for this expert
             skill_embedding = self.mlp_layers[expert_idx](skill_embedding)  # (batch_size, features_dim)
             
-            # Get per-sample weights for this expert
-            expert_weights = all_weights[:, expert_idx]  # (batch_size,)
+            # Get per-sample weights for this expert from the weight matrix
+            expert_weights = weights_to_use[:, expert_idx]  # (batch_size,)
             
             # Weight and accumulate
             weighted_output = skill_embedding * expert_weights.unsqueeze(1)  # (batch_size, features_dim)
             output += weighted_output
         
         # Store weights for visualization
-        self.training_weights.append(all_weights.detach().cpu().numpy())
+        self.training_weights.append(weights_to_use.detach().cpu().numpy())
         for i, skill in enumerate(self.skills):
-            self.expert_weights[skill.name] = all_weights[:, i].detach().cpu().tolist()
+            self.expert_weights[skill.name] = weights_to_use[:, i].detach().cpu().tolist()
         
         return output
