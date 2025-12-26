@@ -20,7 +20,7 @@ if config_path.exists():
 
 data_path = config.get("data_path", "./data")
 img_sz = config.get("IMG_SZ", 84)
-batch_size = 64
+batch_size = 16
 max_training_steps = 250000
 
 os.makedirs('./skills/torch_models', exist_ok=True)
@@ -66,17 +66,19 @@ def main():
     
     # Create datasets and dataloaders
     dataset_ts = AutoencoderDataset(episode_paths, train_idxs, img_sz)
-    train_load = DataLoader(dataset_ts, batch_size, shuffle=True, pin_memory=True)
+    train_load = DataLoader(dataset_ts, batch_size, shuffle=True, pin_memory=True, 
+                           num_workers=2, prefetch_factor=2)
 
     dataset_vs = AutoencoderDataset(episode_paths, val_idxs, img_sz)
-    val_load = DataLoader(dataset_vs, batch_size, shuffle=False, pin_memory=True)
+    val_load = DataLoader(dataset_vs, batch_size, shuffle=False, pin_memory=True, 
+                         num_workers=2)
 
     # Initialize model
     channels = 1  # Set to 3 if using RGB images
     autoencoder = Autoencoder(channels=channels).to(device)
-    autoencoder = torch.compile(autoencoder, mode='default')
+    autoencoder = torch.compile(autoencoder, mode='max-autotune')
     
-    criterion = nn.MSELoss().cuda() if torch.cuda.is_available() else nn.MSELoss()
+    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-3)
 
     print(f"\nStarting training with {max_training_steps} steps...")
@@ -94,14 +96,14 @@ def main():
 
         # training batches
         for i, (inputs, targets) in enumerate(train_load):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             outputs = autoencoder(inputs)
             loss = criterion(outputs, targets)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            train_losses.append(loss.detach().cpu().item())
+            train_losses.append(loss.item())
 
         avg_train_loss = sum(train_losses) / len(train_losses) if len(train_losses) > 0 else 0.0
 
@@ -112,11 +114,11 @@ def main():
             with torch.no_grad():
                 autoencoder.eval()
                 for i, (inputs, targets) in enumerate(val_load):
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
+                    inputs = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
                     out = autoencoder(inputs)
                     vloss = criterion(out, targets)
-                    val_losses.append(vloss.detach().cpu().item())
+                    val_losses.append(vloss.item())
 
             avg_val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else float('nan')
             last_val_loss = avg_val_loss

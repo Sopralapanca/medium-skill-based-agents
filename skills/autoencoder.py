@@ -61,35 +61,41 @@ class AutoencoderDataset(Dataset):
         self.episode_paths = episode_paths
         self.idxs = idxs
         self.frame_size = frame_size
+        
+        # Pre-cache episode metadata to avoid repeated directory listings
+        print("Caching episode metadata...")
+        self.episode_lengths = {}
+        self.valid_episodes = []  # Only episodes with at least 4 frames
+        for idx in idxs:
+            episode_path = episode_paths[idx]
+            num_images = len([f for f in os.listdir(episode_path) if f.endswith('.png')])
+            if num_images >= 4:
+                self.episode_lengths[idx] = num_images
+                self.valid_episodes.append(idx)
+        print(f"Cached {len(self.valid_episodes)} valid episodes")
 
     def __len__(self):
-        return len(self.idxs)
+        return len(self.valid_episodes)  # One sample per episode per epoch
 
     def __getitem__(self, idx):
-        # Choose a random episode from the available indices
-        num_images = 0
-        while num_images < 4:
-            episode_idx = np.random.choice(self.idxs)
-            episode_path = self.episode_paths[episode_idx]
-            
-            # Get number of images in this episode
-            num_images = len([f for f in os.listdir(episode_path) if f.endswith('.png')])
+        # Choose a random episode from the valid episodes (with pre-cached lengths)
+        episode_idx = np.random.choice(self.valid_episodes)
+        episode_path = self.episode_paths[episode_idx]
+        num_images = self.episode_lengths[episode_idx]
         
         # Choose a random timestep (ensuring we can get 4 consecutive frames)
         t = np.random.randint(3, num_images)
         
+        # Pre-allocate numpy array for better performance
+        frames = np.empty((4, self.frame_size, self.frame_size), dtype=np.float32)
+        
         # Load 4 consecutive frames and stack them
-        frames = []
-        for i in range(t-3, t+1):  # Load frames at t-3, t-2, t-1, t
-            pil = Image.open(f"{episode_path}/{i}.png").convert('L').resize((self.frame_size, self.frame_size))
-            img = np.array(pil, dtype=np.float32) / 255.0
-            frames.append(img)
+        for j, i in enumerate(range(t-3, t+1)):  # Load frames at t-3, t-2, t-1, t
+            pil = Image.open(f"{episode_path}/{i}.png").convert('L').resize((self.frame_size, self.frame_size), Image.BILINEAR)
+            frames[j] = np.asarray(pil, dtype=np.float32) / 255.0
         
-        # Stack frames to create input (4, H, W)
-        stacked_frames = np.stack(frames, axis=0)
-        input_tensor = torch.from_numpy(stacked_frames).contiguous().float()
-        
-        # Target is just the last frame (1, H, W)
-        target_tensor = torch.from_numpy(frames[-1]).unsqueeze(0).contiguous().float()
+        # Convert to tensors
+        input_tensor = torch.from_numpy(frames).contiguous()
+        target_tensor = torch.from_numpy(frames[-1:]).contiguous()  # Keep as (1, H, W)
         
         return input_tensor, target_tensor
