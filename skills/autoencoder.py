@@ -10,21 +10,22 @@ from skills.skill_interface import Skill, model_forward
 class Autoencoder(nn.Module):
     def __init__(self, channels=1):
         super(Autoencoder, self).__init__()
-        # Encoder
+        # Encoder - takes 4 stacked frames as input
         self.encoder = nn.Sequential(
-            nn.Conv2d(channels, 32, kernel_size=8, stride=4),
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),  # Changed to accept 4 input channels
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=1), # changed stride from 2 to 1 wrt original
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU()
         )
+        # Decoder - outputs single frame reconstruction
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.ConvTranspose2d(64, 32, kernel_size=3, stride=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, channels, kernel_size=8, stride=4),
+            nn.ConvTranspose2d(32, 1, kernel_size=8, stride=4),  # Output 1 channel
             nn.Sigmoid()  # Sigmoid to ensure pixel values are between 0 and 1
         )
     def forward(self, x):
@@ -66,18 +67,29 @@ class AutoencoderDataset(Dataset):
 
     def __getitem__(self, idx):
         # Choose a random episode from the available indices
-        episode_idx = np.random.choice(self.idxs)
-        episode_path = self.episode_paths[episode_idx]
+        num_images = 0
+        while num_images < 4:
+            episode_idx = np.random.choice(self.idxs)
+            episode_path = self.episode_paths[episode_idx]
+            
+            # Get number of images in this episode
+            num_images = len([f for f in os.listdir(episode_path) if f.endswith('.png')])
         
-        # Get number of images in this episode
-        num_images = len([f for f in os.listdir(episode_path) if f.endswith('.png')])
+        # Choose a random timestep (ensuring we can get 4 consecutive frames)
+        t = np.random.randint(3, num_images)
         
-        # Choose a random timestep
-        t = np.random.randint(0, num_images)
-        # Load and preprocess the image as grayscale (single channel)
-        pil = Image.open(f"{episode_path}/{t}.png").convert('L').resize((self.frame_size, self.frame_size))
-        img = np.array(pil, dtype=np.float32) / 255.0
-        img = torch.from_numpy(img).contiguous().float()
-        # add channel dimension -> (1, H, W)
-        img = img.unsqueeze(0)
-        return img
+        # Load 4 consecutive frames and stack them
+        frames = []
+        for i in range(t-3, t+1):  # Load frames at t-3, t-2, t-1, t
+            pil = Image.open(f"{episode_path}/{i}.png").convert('L').resize((self.frame_size, self.frame_size))
+            img = np.array(pil, dtype=np.float32) / 255.0
+            frames.append(img)
+        
+        # Stack frames to create input (4, H, W)
+        stacked_frames = np.stack(frames, axis=0)
+        input_tensor = torch.from_numpy(stacked_frames).contiguous().float()
+        
+        # Target is just the last frame (1, H, W)
+        target_tensor = torch.from_numpy(frames[-1]).unsqueeze(0).contiguous().float()
+        
+        return input_tensor, target_tensor

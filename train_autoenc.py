@@ -93,10 +93,11 @@ def main():
         train_losses = []
 
         # training batches
-        for i, imgs in enumerate(train_load):
-            imgs = imgs.to(device)
-            outputs = autoencoder(imgs)
-            loss = criterion(outputs, imgs)
+        for i, (inputs, targets) in enumerate(train_load):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            outputs = autoencoder(inputs)
+            loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -110,10 +111,11 @@ def main():
             val_losses = []
             with torch.no_grad():
                 autoencoder.eval()
-                for i, imgs in enumerate(val_load):
-                    imgs = imgs.to(device)
-                    out = autoencoder(imgs)
-                    vloss = criterion(out, imgs)
+                for i, (inputs, targets) in enumerate(val_load):
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    out = autoencoder(inputs)
+                    vloss = criterion(out, targets)
                     val_losses.append(vloss.detach().cpu().item())
 
             avg_val_loss = sum(val_losses) / len(val_losses) if len(val_losses) > 0 else float('nan')
