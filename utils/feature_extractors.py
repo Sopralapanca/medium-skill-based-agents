@@ -10,6 +10,19 @@ import numpy as np
 import math
 
 
+def get_embedding_for_context(
+        observations: torch.Tensor,
+        encoder
+    ) -> torch.Tensor:
+        """Extract context for routing decisions"""
+
+        with torch.no_grad():
+            z = encoder(observations)
+            z = torch.reshape(z, (z.size(0), -1))
+
+        return z
+
+
 class FeaturesExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
@@ -119,8 +132,7 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
         sample = observation_space.sample()  # 4x84x84
         sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
-        sample = torch.from_numpy(sample) / 255
-        sample = sample.to(device)
+        sample = torch.from_numpy(sample).to(device)
 
         # dropout_p = 0.1
 
@@ -149,7 +161,7 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
         self.encoder = model.encoder
 
-        z = self.get_last_frame_embedding_for_context(sample)
+        z = get_embedding_for_context(sample, self.encoder)
         self.input_size = z.shape[-1]
 
         self.encoder_lin_layer = nn.Sequential(
@@ -174,24 +186,16 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         self.linear_adapters = []
         self.training_weights = []
 
-    def get_last_frame_embedding_for_context(
-        self, observations: torch.Tensor
-    ) -> torch.Tensor:
-        x = observations[:, -1:, :, :]
-        with torch.no_grad():
-            z = self.encoder(x)
-            z = torch.reshape(z, (z.size(0), -1))
-
-        return z
-
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # print("forward observation shape", observations.shape)
         # -------------- saving stats -------------- #
+        
+        
         weights = []
 
         self.preprocess_input(observations)  # this will populate self.skills_embeddings
 
-        encoded_frame = self.get_last_frame_embedding_for_context(observations)
+        encoded_frame = get_embedding_for_context(observations, self.encoder)
         encoded_frame = self.encoder_lin_layer(encoded_frame)  # query
 
         for i in range(len(self.skills_embeddings)):
@@ -264,7 +268,7 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         self.encoder = model.encoder
         
         
-        z = self.get_embedding_for_context(sample)
+        z = get_embedding_for_context(sample, self.encoder)
         self.input_size = z.shape[-1]
 
         # Router network: takes context and outputs logits for each expert
@@ -284,6 +288,7 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
                 nn.Linear(
                     self.skills_embeddings[i].shape[1], features_dim, device=device
                 ),
+                nn.LayerNorm(features_dim),
                 nn.ReLU(),
             )
 
@@ -293,23 +298,21 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         self.expert_weights = {}
         self.selected_experts = []
         self.training_weights = []
+         
 
-    def get_embedding_for_context(
-        self, observations: torch.Tensor
-    ) -> torch.Tensor:
-        """Extract context for routing decisions"""
-
-        with torch.no_grad():
-            z = self.encoder(observations)
-            z = torch.reshape(z, (z.size(0), -1))
-
-        return z
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        observations = observations.to(self.device) 
+         
         batch_size = observations.shape[0]
 
-        context = self.get_embedding_for_context(observations)
+        context = get_embedding_for_context(observations, self.encoder)
         router_logits = self.router(context)  # (batch_size, num_experts)
+        
+        if self.training:
+            # Add noise to logits to force exploration of different experts
+            noise = torch.randn_like(router_logits) * 1.0  # Tunable noise level
+            router_logits = router_logits + noise
 
         top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
 
