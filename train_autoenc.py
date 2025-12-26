@@ -20,6 +20,7 @@ if config_path.exists():
 
 data_path = config.get("data_path", "./data")
 img_sz = config.get("IMG_SZ", 84)
+# Larger batch size for GPU efficiency - GPUs need more data to be efficient
 batch_size = 16
 max_training_steps = 250000
 
@@ -66,17 +67,19 @@ def main():
     
     # Create datasets and dataloaders
     dataset_ts = AutoencoderDataset(episode_paths, train_idxs, img_sz)
+    # More workers for GPU to keep it fed with data
+    num_workers = 2
     train_load = DataLoader(dataset_ts, batch_size, shuffle=True, pin_memory=True, 
-                           num_workers=2, prefetch_factor=2)
+                           num_workers=num_workers, prefetch_factor=3, persistent_workers=True)
 
     dataset_vs = AutoencoderDataset(episode_paths, val_idxs, img_sz)
     val_load = DataLoader(dataset_vs, batch_size, shuffle=False, pin_memory=True, 
-                         num_workers=2)
+                         num_workers=num_workers, persistent_workers=True)
 
     # Initialize model
     channels = 1  # Set to 3 if using RGB images
     autoencoder = Autoencoder(channels=channels).to(device)
-    autoencoder = torch.compile(autoencoder, mode='max-autotune')
+    autoencoder = torch.compile(autoencoder, mode='reduce-overhead')
     
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-3)
