@@ -342,34 +342,32 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         # Process context through linear layer for refinement
         context_encoded = self.encoder_lin_layer(context_raw)  # (batch_size, features_dim)
         
-        # Compute weights for all selected experts (batch-wise, like WSA)
-        weight_logits = []
-        for expert_idx in unique_experts:
-            # Concatenate context with skill embedding for ALL samples in batch
-            concatenated = torch.cat([context_encoded, expert_to_embedding[expert_idx]], dim=1)  # (batch_size, 2*features_dim)
-            weight_logit = self.weight_refiner(concatenated)  # (batch_size, 1)
-            weight_logits.append(weight_logit)
-        
-        # Stack weights: (batch_size, num_unique_experts)
-        weight_logits = torch.cat(weight_logits, dim=1)
-        
-        # Create mask for selected experts per sample
-        # Initialize with -inf so unselected experts get zero weight after softmax
+        # Build a list to collect (batch_idx, expert_idx, weight_logit) for selected pairs only
         refined_logits = torch.full((batch_size, len(self.skills)), float('-inf'), device=self.device)
         
-        # Fill in logits for selected experts
-        for i, expert_idx in enumerate(unique_experts):
-            refined_logits[:, expert_idx] = weight_logits[:, i]
+        # For each sample, compute refined weights only for its selected experts
+        for batch_idx in range(batch_size):
+            sample_experts = top_k_indices[batch_idx]  # (top_k,) - experts selected by this sample
+            sample_logits = []
+            
+            for expert_idx in sample_experts:
+                expert_idx_val = expert_idx.item()
+                # Only compute weight for this specific (sample, expert) pair
+                concatenated = torch.cat([
+                    context_encoded[batch_idx:batch_idx+1], 
+                    expert_to_embedding[expert_idx_val][batch_idx:batch_idx+1]
+                ], dim=1)  # (1, 2*features_dim)
+                weight_logit = self.weight_refiner(concatenated)  # (1, 1)
+                sample_logits.append(weight_logit.squeeze())
+            
+            # Softmax over this sample's selected experts only
+            sample_weights = torch.softmax(torch.stack(sample_logits), dim=0)
+            
+            # Assign weights to the selected experts for this sample
+            for i, expert_idx in enumerate(sample_experts):
+                refined_logits[batch_idx, expert_idx] = torch.log(sample_weights[i] + 1e-10)
         
-        # Mask out experts that weren't selected by each sample
-        # Create a mask: (batch_size, num_experts)
-        expert_mask = torch.zeros(batch_size, len(self.skills), dtype=torch.bool, device=self.device)
-        expert_mask.scatter_(1, top_k_indices, True)
-        
-        # Set non-selected experts to -inf
-        refined_logits[~expert_mask] = float('-inf')
-        
-        # Softmax per sample over selected experts (ensures weights sum to 1.0)
+        # Apply softmax (log-softmax-exp pattern for numerical stability)
         refined_weights = torch.softmax(refined_logits, dim=1)  # (batch_size, num_experts)
         
         # ========== Combine Expert Outputs ==========
