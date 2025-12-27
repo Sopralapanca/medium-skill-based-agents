@@ -55,8 +55,7 @@ class GatingMonitorCallback(BaseCallback):
         save_file = os.path.join(self.save_path, f"gating_weights_{self.env}.pkl")
         with open(save_file, 'wb') as f:
             pickle.dump(save_data, f)
-        
-        print(f"\nGating weights saved to {save_file}")
+    
 
 
 def plot_gating_distribution(weights_file, output_dir="./gating_plots"):
