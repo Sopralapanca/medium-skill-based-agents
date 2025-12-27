@@ -213,7 +213,8 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         weights = torch.stack(weights, 1)
         weights = torch.softmax(weights, 1)
 
-        self.training_weights.append(weights.detach().cpu().numpy())
+        # Store on GPU - only transfer when needed for logging
+        self.training_weights.append(weights.detach())
         # weights = self.dropout(weights)
 
         # save attention weights to plot them in evaluation
@@ -365,7 +366,7 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
             self.load_balance_loss = self._compute_load_balance_loss(router_probs, top_k_indices)
         
         # Store weights for visualization
-        self.training_weights.append(all_weights.detach().cpu().numpy())
+        self.training_weights.append(all_weights.detach())
         for i, skill in enumerate(self.skills):
             self.expert_weights[skill.name] = all_weights[:, i].detach().cpu().tolist()
 
@@ -434,3 +435,137 @@ class MixtureOfExpertsExtractor(FeaturesExtractor):
         :return: Load balancing loss tensor (scalar)
         """
         return self.load_balance_loss
+    
+    
+    
+    
+    
+    
+    
+    
+    
+class SoftHardMOE(FeaturesExtractor):
+    def __init__(
+        self,
+        observation_space: spaces.Box,
+        features_dim: int = 256,
+        skills: List[Skill] | None = None,
+        device="cpu",
+        initial_temperature: float = 1.0,  # Start with soft routing
+        min_temperature: float = 0.1,      # End with nearly-hard routing
+        temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
+    ):
+        """
+        Mixture of Experts with soft-to-hard routing transition.
+        
+        :param observation_space: Gymnasium observation space
+        :param features_dim: Number of features extracted from the observations
+        :param skills: List of skill objects (experts)
+        :param device: Device used for computation
+        :param initial_temperature: Starting temperature (1.0 = soft, uniform routing)
+        :param min_temperature: Minimum temperature (0.1 = nearly hard routing)
+        :param temperature_decay: Decay rate per forward pass (0.99995 recommended for 1M steps)
+        
+        Temperature annealing schedule:
+        - At temp=1.0: Router weights are soft, all experts contribute
+        - At temp=0.1: Router weights are sharp, dominant expert(s) take over
+        - Decay of 0.99995 reaches min_temp after ~460k forward passes
+        """
+
+        super().__init__(observation_space, features_dim, skills, device)
+
+        self.device = device
+        
+        # Temperature annealing parameters
+        self.temperature = initial_temperature
+        self.min_temperature = min_temperature
+        self.temperature_decay = temperature_decay
+
+        self.num_experts = len(skills)
+
+        sample = observation_space.sample()  # 4x84x84
+        sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
+        sample = torch.from_numpy(sample) / 255
+        sample = sample.to(device)
+
+        # Context encoder for routing decisions
+        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
+        model = Autoencoder().to(device)
+        model = torch.compile(model, mode="reduce-overhead")
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
+        model.eval()
+        self.encoder = model.encoder
+        
+        
+        z = get_embedding_for_context(sample, self.encoder)
+        self.input_size = z.shape[-1]
+
+        # Router network: takes context and outputs logits for each expert
+        self.router = nn.Sequential(
+            nn.Linear(self.input_size, features_dim, device=device),
+            nn.ReLU(),
+            nn.Linear(features_dim, len(self.skills), device=device),
+        )
+
+        # MLP layers for each skill to project to features_dim
+        self.preprocess_input(sample)  # populate self.skills_embeddings
+        
+        self.mlp_layers = nn.ModuleList()
+        for i in range(len(self.skills_embeddings)):
+            seq_layer = nn.Sequential(
+                nn.Linear(
+                    self.skills_embeddings[i].shape[1], features_dim, device=device
+                ),
+                nn.LayerNorm(features_dim),
+                nn.ReLU(),
+            )
+
+            self.mlp_layers.append(seq_layer)
+
+        # Tracking
+        self.training_weights = []
+        
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        observations = observations.to(self.device)
+        batch_size = observations.shape[0]
+
+        # Get routing logits from context
+        context = get_embedding_for_context(observations, self.encoder)
+        router_logits = self.router(context)  # (batch_size, num_experts)
+        
+        # Apply temperature scaling for soft-to-hard transition
+        # Higher temp = softer (more uniform), Lower temp = harder (more peaked)
+        scaled_logits = router_logits / self.temperature
+        router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
+        
+        # Anneal temperature during training
+        if self.training:
+            self.temperature = max(
+                self.min_temperature,
+                self.temperature * self.temperature_decay
+            )
+            
+
+        # Process ALL experts (soft routing - no information loss)
+        self.preprocess_input(observations)  # Processes all skills
+
+        # Weighted combination of expert outputs
+        output = torch.zeros(batch_size, self.features_dim, device=self.device)
+        
+        for i in range(self.num_experts):
+            # Get skill embedding (already computed for all experts)
+            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
+            
+            # Project through trainable MLP
+            skill_embedding = self.mlp_layers[i](skill_embedding)  # (batch_size, features_dim)
+            
+            # Weight by router decision
+            expert_weight = router_weights[:, i].unsqueeze(1)  # (batch_size, 1)
+            weighted_output = skill_embedding * expert_weight  # (batch_size, features_dim)
+            
+            output += weighted_output
+
+        # Store weights for visualization (detach and move to CPU to save GPU memory)
+        self.training_weights.append(router_weights.detach())
+    
+        return output

@@ -44,6 +44,8 @@ class Autoencoder(nn.Module):
         self.load_state_dict(torch.load(model_path, map_location=device), strict=True)
         self.to(device)
         self.eval()
+        # Compile encoder for better GPU performance
+        self.encoder = torch.compile(self.encoder, mode='reduce-overhead')
         
         input_transformation_function = self.autoencoder_input_trans
         return Skill("autoencoder", input_transformation_function, self.encoder, model_forward, None)

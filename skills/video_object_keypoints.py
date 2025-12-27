@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
 from torch.utils.data import Dataset, Sampler
 import os
 import random
@@ -195,10 +194,13 @@ class Transporter(nn.Module):
         model.eval()
         model.to(device)
         
+        # Compile the submodules for GPU optimization
         if keynet_or_encoder == 'encoder':
-            return Skill("obj_key_enc", input_transformation_function, model.encoder, model_forward, None)
+            compiled_encoder = torch.compile(model.encoder, mode='default')
+            return Skill("obj_key_enc", input_transformation_function, compiled_encoder, model_forward, None)
         elif keynet_or_encoder == 'keynet':
-            return Skill("obj_key_key", input_transformation_function, model.key_net, model_forward, None)
+            compiled_keynet = torch.compile(model.key_net, mode='default')
+            return Skill("obj_key_key", input_transformation_function, compiled_keynet, model_forward, None)
         else:
             raise ValueError("keynet_or_encoder must be either 'encoder' or 'keynet'")
 
