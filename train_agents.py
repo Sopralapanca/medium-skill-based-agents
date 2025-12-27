@@ -18,7 +18,9 @@ from skills.unsupervised_state_representation import UnsupervisedStateRepresenta
 from skills.video_object_keypoints import Transporter
 from skills.video_object_segmentation import VideoObjectSegmentationModel
 
-from utils.feature_extractors import WeightSharingAttentionExtractor, MixtureOfExpertsExtractor
+from utils.feature_extractors import WeightSharingAttentionExtractor, MixtureOfExpertsExtractor, SoftHardMOE
+from utils.custom_ppo import CustomPPO
+from utils.monitor_moe_weights import GatingMonitorCallback
 
 # IMPORTANT - REGISTER THE ENVIRONMENTS
 import gymnasium as gym
@@ -30,16 +32,108 @@ from dotenv import load_dotenv
 import ale_py
 gym.register_envs(ale_py)
 
-
 load_dotenv()
 
 
-# key = os.getenv("WANDB_API_KEY")
-# if key is None:
-#     raise ValueError("WANDB_API_KEY not set")
+key = os.getenv("WANDB_API_KEY")
+if key is None:
+    raise ValueError("WANDB_API_KEY not set")
 
-# wandb.login(key=key)
 
+def create_env(env_id, configs, seed=None):
+    env = make_atari_env(env_id, n_envs=configs["n_envs"], seed=seed)
+    env = VecFrameStack(env, n_stack=configs["n_stacks"])
+    env = VecTransposeImage(env)
+    return env
+
+
+def init_wandb(environment_configuration):
+  wandb.login(key=key)
+
+  tags = [
+      f"fe:{environment_configuration['f_ext_name']}",
+      f"game:{environment_configuration['game']}",
+  ]
+
+  run = wandb.init(
+      project="medium-skill-based-agents",
+      config=environment_configuration,
+      sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+      monitor_gym=False,  # auto-upload the videos of agents playing the game
+      group=f"{environment_configuration['game']}",
+      tags=tags
+      # save_code = True,  # optional
+  )
+
+  return run
+
+
+def train_agent(env_id, configs, policy_kwargs, seed):
+    
+    run = init_wandb(configs)
+    logdir = "./tensorboard_logs"
+    
+    # monitor_dir = str(run.id)
+    monitor_dir = "ppo"
+
+    vec_envs = create_env(env_id=env_id, configs=configs, seed=seed)
+    _ = vec_envs.reset()
+    
+    eval_envs = create_env(env_id=env_id, configs=configs, seed=None)
+
+    model = CustomPPO(  # Changed from PPO to CustomPPO
+        "CnnPolicy",
+        vec_envs,
+        learning_rate=linear_schedule(environment_configuration["learning_rate"]),
+        n_steps=environment_configuration["n_steps"],
+        n_epochs=environment_configuration["n_epochs"],
+        batch_size=environment_configuration["batch_size"],
+        clip_range=linear_schedule(environment_configuration["clip_range"]),
+        normalize_advantage=environment_configuration["normalize"],
+        ent_coef=environment_configuration["ent_coef"],
+        vf_coef=environment_configuration["vf_coef"],
+        policy_kwargs=policy_kwargs,
+        verbose=0,
+        device=device,
+        tensorboard_log=logdir,
+    )
+
+
+    eval_logs = f"eval_logs/{env}/{monitor_dir}"
+    os.makedirs(eval_logs, exist_ok=True)
+
+    # eval_callback = EvalCallback(
+    #     eval_envs,
+    #     n_eval_episodes=100,
+    #     best_model_save_path=f"./agents/{monitor_dir}",
+    #     log_path=eval_logs,
+    #     eval_freq=5000 * environment_configuration["n_envs"],
+    #     verbose=0,
+    # )
+    
+    
+    callbacks = [
+        WandbCallback(verbose=0),
+        # eval_callback
+    ]
+
+    if configs["f_ext_name"] == "moe_ext":
+        # Get the feature extractor from the model
+        feature_extractor = model.policy.features_extractor
+
+        # Create monitoring callback
+        gating_monitor = GatingMonitorCallback(
+            feature_extractor=feature_extractor,
+            env=env_id,
+            save_freq=500,  # Save every 500 steps
+            save_path="./gating_weights",
+            verbose=0
+        )
+        
+        callbacks.append(gating_monitor)
+        
+    model.learn(1000000, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
+    run.finish()
 
 # Load config
 _config_path = "./configs.yaml"
@@ -69,27 +163,16 @@ environment_configuration["f_ext_kwargs"]["device"] = device  #do not comment th
 environment_configuration["game"] = env
 
 
-# monitor_dir = f"monitor/{run.id}"
-monitor_dir = "ppo"
+policy_kwargs = dict(
+    net_arch={
+        "pi": environment_configuration["net_arch_pi"],
+        "vf": environment_configuration["net_arch_vf"],
+    },
+    # activation_fn=torch.nn.ReLU,  # use ReLU in case of multiple layers for the policy learning network
+)
 
-# Create a short-lived env to collect an observation for skill initialization,
-# then close it. Training environments will be created per-agent inside the loop.
-temp_envs = make_atari_env(env, n_envs=environment_configuration["n_envs"], seed=seed)
-temp_envs = VecFrameStack(temp_envs, n_stack=environment_configuration["n_stacks"])
-temp_envs = VecTransposeImage(temp_envs)
-
-# execute some steps with random moves to get a representative observation
-obs = temp_envs.reset()
-for i in range(10):
-    action = [temp_envs.action_space.sample() for _ in range(environment_configuration["n_envs"])]
-    obs, rewards, dones, info = temp_envs.step(action)
-
-# obs[0] has shape (4, 84, 84) because there are 4 stacked environments, take the first
-observation = obs[0][-1]
-
-# Close the temporary envs - we'll create fresh envs per run below
-temp_envs.close()
-
+test_envs = create_env(env_id=env, configs=environment_configuration, seed=seed)
+obs = test_envs.reset()
 
 # init skills
 autoencoder = Autoencoder(channels=1).to(device)
@@ -107,110 +190,17 @@ skills = [
    
 
 f_ext_kwargs = environment_configuration["f_ext_kwargs"]
+environment_configuration["f_ext_name"] = "moe_ext"
+environment_configuration["f_ext_class"] = SoftHardMOE
+f_ext_kwargs["skills"] = skills
+f_ext_kwargs["features_dim"] = 256
 
-for feature_extractor_class in ["ppo", "wsa", "moe"]:
-
-    if feature_extractor_class == "wsa":
-        environment_configuration["f_ext_name"] = "wsharing_attention_ext"
-        environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
-    elif feature_extractor_class == "moe":
-        environment_configuration["f_ext_name"] = "moe_ext"
-        environment_configuration["f_ext_class"] = MixtureOfExpertsExtractor
-    
-    # else ppo default CNN policy
-    
-    tags = [
-        f"fe:{environment_configuration['f_ext_name']}",
-        f"game:{environment_configuration['game']}",
-    ]
-
-    # run = wandb.init(
-    #     project="medium-skill-based-agents",
-    #     config=environment_configuration,
-    #     sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-    #     monitor_gym=False,  # auto-upload the videos of agents playing the game
-    #     group=f"{environment_configuration['game']}",
-    #     tags=tags
-    #     # save_code = True,  # optional
-    # )
+# Exploration and load balancing parameters
+f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
+f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
 
 
-    if feature_extractor_class != "ppo":
-        f_ext_kwargs["skills"] = skills
-    
-    f_ext_kwargs["features_dim"] = 256
+policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
+policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
-    policy_kwargs = {}
-    if "f_ext_class" in environment_configuration:
-        policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
-
-    # Only pass extractor kwargs when a custom extractor is used
-    if "f_ext_kwargs" in environment_configuration and feature_extractor_class != "ppo":
-        policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
-
-    policy_kwargs["net_arch"] = {
-        "pi": environment_configuration["net_arch_pi"],
-        "vf": environment_configuration["net_arch_vf"],
-    }
-
-    logdir = "./tensorboard_logs"
-
-    # create a fresh training env for this run (do not reuse)
-    vec_envs = make_atari_env(env, n_envs=environment_configuration["n_envs"], seed=seed)
-    vec_envs = VecFrameStack(vec_envs, n_stack=environment_configuration["n_stacks"])
-    vec_envs = VecTransposeImage(vec_envs)
-
-    model = PPO(
-        "CnnPolicy",
-        vec_envs,
-        learning_rate=linear_schedule(environment_configuration["learning_rate"]),
-        n_steps=128,
-        n_epochs=4,
-        batch_size=environment_configuration["batch_size"],
-        clip_range=linear_schedule(environment_configuration["clip_range"]),
-        normalize_advantage=environment_configuration["normalize"],
-        ent_coef=environment_configuration["ent_coef"],
-        vf_coef=environment_configuration["vf_coef"],
-        policy_kwargs=policy_kwargs if len(policy_kwargs) > 0 else None,
-        verbose=1,
-        device=device,
-        tensorboard_log=logdir,
-    )
-
-
-
-    eval_env = make_atari_env(env, n_envs=environment_configuration["n_envs"])
-    eval_env = VecFrameStack(eval_env, n_stack=environment_configuration["n_stacks"])
-    eval_env = VecTransposeImage(eval_env)
-
-    eval_logs = f"eval_logs/{env}/{monitor_dir}"
-    os.makedirs(eval_logs, exist_ok=True)
-
-    callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=21, verbose=1)
-    
-    eval_callback = EvalCallback(
-        eval_env,
-        n_eval_episodes=100,
-        best_model_save_path=f"./agents/{monitor_dir}",
-        log_path=eval_logs,
-        eval_freq=5000 * environment_configuration["n_envs"],
-        verbose=0,
-        callback_on_new_best=callback_on_best
-    )
-
-    callbacks = [
-        #WandbCallback(verbose=0),
-        eval_callback
-    ]
-
-    model.learn(2000, callback=callbacks) #tb_log_name=run.id)
-    # close environments to avoid state leakage between runs
-    try:
-        vec_envs.close()
-    except Exception:
-        pass
-    try:
-        eval_env.close()
-    except Exception:
-        pass
-    #run.finish()
+train_agent(env, environment_configuration, policy_kwargs, seed)

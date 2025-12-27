@@ -565,7 +565,7 @@ class SoftHardMOE(FeaturesExtractor):
             
             output += weighted_output
 
-        # Store weights for visualization (detach and move to CPU to save GPU memory)
+        # Store weights for visualization
         self.training_weights.append(router_weights.detach())
     
         return output

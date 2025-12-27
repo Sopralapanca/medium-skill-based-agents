@@ -97,7 +97,7 @@ def plot_gating_distribution(weights_file, output_dir="./gating_plots"):
         print("Error: No valid weights found!")
         return None
     
-    all_weights_concat = np.concatenate(all_weights_concat, axis=0)  # (total_steps, num_experts)
+    all_weights_concat = np.concatenate([w.cpu().numpy() for w in all_weights_concat], axis=0)  # (total_steps, num_experts)
     
     # Calculate statistics
     print(f"\nTotal steps recorded: {all_weights_concat.shape[0]}")
