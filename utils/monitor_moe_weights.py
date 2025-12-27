@@ -23,8 +23,8 @@ class GatingMonitorCallback(BaseCallback):
         # Save weights periodically
         if self.n_calls % self.save_freq == 0:
             if hasattr(self.feature_extractor, 'training_weights') and len(self.feature_extractor.training_weights) > 0:
-                # Get the accumulated weights
-                weights = np.array(self.feature_extractor.training_weights)
+                # Get the accumulated weights (keep as list to handle variable batch sizes)
+                weights = self.feature_extractor.training_weights.copy()
                 self.all_weights.append(weights)
                 self.timesteps.append(self.num_timesteps)
                 
@@ -32,7 +32,8 @@ class GatingMonitorCallback(BaseCallback):
                 self.feature_extractor.training_weights = []
                 
                 if self.verbose > 0:
-                    print(f"Step {self.num_timesteps}: Saved gating weights (shape: {weights.shape})")
+                    total_samples = sum(w.shape[0] for w in weights)
+                    print(f"Step {self.num_timesteps}: Saved {len(weights)} weight arrays ({total_samples} total samples)")
         
         return True
     
@@ -40,7 +41,7 @@ class GatingMonitorCallback(BaseCallback):
         """Save all collected weights at the end of training"""
         # Save any remaining weights
         if hasattr(self.feature_extractor, 'training_weights') and len(self.feature_extractor.training_weights) > 0:
-            weights = np.array(self.feature_extractor.training_weights)
+            weights = self.feature_extractor.training_weights.copy()
             self.all_weights.append(weights)
             self.timesteps.append(self.num_timesteps)
         
@@ -83,11 +84,19 @@ def plot_gating_distribution(weights_file, output_dir="./gating_plots"):
     
     # Concatenate all weight arrays
     all_weights_concat = []
-    for w in weights:
-        # w has shape (num_steps_in_chunk, batch_size, num_experts)
-        # Average over batch dimension
-        w_mean = np.mean(w, axis=1)  # (num_steps_in_chunk, num_experts)
-        all_weights_concat.append(w_mean)
+    for checkpoint_weights in weights:
+        # checkpoint_weights is a list of numpy arrays with varying batch sizes
+        for w in checkpoint_weights:
+            # w has shape (batch_size, num_experts)
+            # Average over batch dimension to get per-step values
+            if len(w.shape) == 2:
+                all_weights_concat.append(w)  # Keep individual samples
+            else:
+                print(f"Warning: Unexpected weight shape {w.shape}, skipping")
+    
+    if not all_weights_concat:
+        print("Error: No valid weights found!")
+        return None
     
     all_weights_concat = np.concatenate(all_weights_concat, axis=0)  # (total_steps, num_experts)
     
