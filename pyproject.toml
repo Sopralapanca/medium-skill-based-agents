@@ -13,6 +13,7 @@ dependencies = [
     "huggingface-sb3>=3.0",
     "imageio>=2.37.2",
     "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
     "kornia>=0.8.2",
     "moviepy>=2.2.1",
     "opencv-python>=4.11.0.86",

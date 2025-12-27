@@ -5,7 +5,7 @@ config : {
     "n_envs": 8,
     "n_stacks": 4,
 
-    "n_steps": 2048, #128,
+    "n_steps": 128,
     "n_epochs": 4,
     "batch_size": 256,
     "n_timesteps": 10000000, #1e7
