@@ -132,7 +132,8 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
         sample = observation_space.sample()  # 4x84x84
         sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
-        sample = torch.from_numpy(sample).to(device)
+        sample = torch.from_numpy(sample) / 255
+        sample = sample.to(device)
 
         # dropout_p = 0.1
 
@@ -454,6 +455,7 @@ class SoftHardMOE(FeaturesExtractor):
         initial_temperature: float = 1.0,  # Start with soft routing
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
+        router_warmup_steps: int = 100000,  # Steps before starting annealing
     ):
         """
         Mixture of Experts with soft-to-hard routing transition.
@@ -480,6 +482,9 @@ class SoftHardMOE(FeaturesExtractor):
         self.temperature = initial_temperature
         self.min_temperature = min_temperature
         self.temperature_decay = temperature_decay
+        self.router_warmup_steps = router_warmup_steps
+        self.step_count = 0
+
 
         self.num_experts = len(skills)
 
@@ -502,10 +507,16 @@ class SoftHardMOE(FeaturesExtractor):
 
         # Router network: takes context and outputs logits for each expert
         self.router = nn.Sequential(
-            nn.Linear(self.input_size, features_dim, device=device),
+            nn.Linear(self.input_size, features_dim // 2, device=device),
             nn.ReLU(),
-            nn.Linear(features_dim, len(self.skills), device=device),
+            nn.Dropout(p=0.1),
+            nn.Linear(features_dim // 2, len(self.skills), device=device),
         )
+        
+        # Initialize router to output near-uniform logits
+        with torch.no_grad():
+            self.router[-1].weight.data *= 0.1  # Small random weights
+            self.router[-1].bias.data.zero_()    # Zero bias = uniform start
 
         # MLP layers for each skill to project to features_dim
         self.preprocess_input(sample)  # populate self.skills_embeddings
@@ -533,17 +544,27 @@ class SoftHardMOE(FeaturesExtractor):
         context = get_embedding_for_context(observations, self.encoder)
         router_logits = self.router(context)  # (batch_size, num_experts)
         
-        # Apply temperature scaling for soft-to-hard transition
-        # Higher temp = softer (more uniform), Lower temp = harder (more peaked)
-        scaled_logits = router_logits / self.temperature
-        router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
+        if self.step_count < self.router_warmup_steps:
+            # Uniform routing - all skills contribute equally
+            router_logits = router_logits.detach()
+            router_weights = torch.ones_like(router_logits) / self.num_experts
+        else:
+            # Apply temperature scaling for soft-to-hard transition
+            # Higher temp = softer (more uniform), Lower temp = harder (more peaked)
+            scaled_logits = router_logits / self.temperature
+            
+            #router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
+            router_weights = F.gumbel_softmax(scaled_logits, tau=self.temperature, hard=False)
+
         
-        # Anneal temperature during training
-        if self.training:
-            self.temperature = max(
-                self.min_temperature,
-                self.temperature * self.temperature_decay
-            )
+            # Anneal temperature during training
+            if self.training:
+                self.temperature = max(
+                    self.min_temperature,
+                    self.temperature * self.temperature_decay
+                )
+        
+        self.step_count += 1
             
 
         # Process ALL experts (soft routing - no information loss)
