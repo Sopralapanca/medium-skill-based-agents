@@ -68,14 +68,16 @@ def init_wandb(environment_configuration):
   return run
 
 
-def train_agent(env_id, configs, policy_kwargs, seed):
+def train_agent(env_id, configs, policy_kwargs, seed, train_steps=5000, wandb=False):
+    if wandb:
+        run = init_wandb(configs)
+        monitor_dir = str(run.id)
+    else:
+        run = None
+        monitor_dir = "ppo"
     
-    run = init_wandb(configs)
     logdir = "./tensorboard_logs"
-    
-    # monitor_dir = str(run.id)
-    monitor_dir = "ppo"
-
+            
     vec_envs = create_env(env_id=env_id, configs=configs, seed=seed)
     _ = vec_envs.reset()
     
@@ -111,13 +113,14 @@ def train_agent(env_id, configs, policy_kwargs, seed):
     #     verbose=0,
     # )
     
-    
     callbacks = [
-        WandbCallback(verbose=0),
         # eval_callback
     ]
+    
+    if wandb:
+        callbacks.append(WandbCallback(verbose=0))
 
-    if configs["f_ext_name"] == "moe_ext":
+    if configs["f_ext_name"] == "moe_ext" or configs["f_ext_name"] == "wsharing_attention_ext":
         # Get the feature extractor from the model
         feature_extractor = model.policy.features_extractor
 
@@ -132,8 +135,10 @@ def train_agent(env_id, configs, policy_kwargs, seed):
         
         callbacks.append(gating_monitor)
         
-    model.learn(1000000, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
-    run.finish()
+    model.learn(train_steps, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
+    
+    if run is not None:
+        run.finish()
 
 # Load config
 _config_path = "./configs.yaml"
@@ -189,18 +194,29 @@ skills = [
 ]
    
 
+# f_ext_kwargs = environment_configuration["f_ext_kwargs"]
+# environment_configuration["f_ext_name"] = "moe_ext"
+# environment_configuration["f_ext_class"] = SoftHardMOE
+# f_ext_kwargs["skills"] = skills
+# f_ext_kwargs["features_dim"] = 256
+
+# # Exploration and load balancing parameters
+# f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
+# f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
+
+
+# policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
+# policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
+
+
+
 f_ext_kwargs = environment_configuration["f_ext_kwargs"]
-environment_configuration["f_ext_name"] = "moe_ext"
-environment_configuration["f_ext_class"] = SoftHardMOE
+environment_configuration["f_ext_name"] = "wsharing_attention_ext"
+environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
-
-# Exploration and load balancing parameters
-f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
-f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
-
 
 policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
-train_agent(env, environment_configuration, policy_kwargs, seed)
+train_agent(env, environment_configuration, policy_kwargs, seed, train_steps=5000, wandb=False)

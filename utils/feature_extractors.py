@@ -192,7 +192,7 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         # -------------- saving stats -------------- #
         
         
-        weights = []
+        weights: List[torch.Tensor] = []
 
         self.preprocess_input(observations)  # this will populate self.skills_embeddings
 
@@ -208,14 +208,15 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
             concatenated = torch.cat([encoded_frame, self.skills_embeddings[i]], 1)
 
-            weight = self.weights(concatenated)
+            weight: torch.Tensor = self.weights(concatenated)
             weights.append(weight)
 
         weights = torch.stack(weights, 1)
-        weights = torch.softmax(weights, 1)
-
+        weights = torch.softmax(weights, 1) # weights shape torch.Size([8, 4, 1])
+        
         # Store on GPU - only transfer when needed for logging
-        self.training_weights.append(weights.detach())
+        # Squeeze last dimension to match monitoring format: [batch, num_experts]
+        self.training_weights.append(weights.squeeze(-1).detach())
         # weights = self.dropout(weights)
 
         # save attention weights to plot them in evaluation
@@ -456,6 +457,7 @@ class SoftHardMOE(FeaturesExtractor):
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
         router_warmup_steps: int = 100000,  # Steps before starting annealing
+        exploration_noise_std: float = 0.3, # noise level for exploration
     ):
         """
         Mixture of Experts with soft-to-hard routing transition.
@@ -478,12 +480,17 @@ class SoftHardMOE(FeaturesExtractor):
 
         self.device = device
         
+        self.exploration_noise_std = exploration_noise_std
+        
         # Temperature annealing parameters
         self.temperature = initial_temperature
         self.min_temperature = min_temperature
         self.temperature_decay = temperature_decay
         self.router_warmup_steps = router_warmup_steps
         self.step_count = 0
+        
+        self.p_keep = 0.7  # Probability to keep each expert active during training
+        
 
 
         self.num_experts = len(skills)
@@ -549,14 +556,23 @@ class SoftHardMOE(FeaturesExtractor):
             router_logits = router_logits.detach()
             router_weights = torch.ones_like(router_logits) / self.num_experts
         else:
-            # Apply temperature scaling for soft-to-hard transition
-            # Higher temp = softer (more uniform), Lower temp = harder (more peaked)
-            scaled_logits = router_logits / self.temperature
+            
+                
+            noise = torch.randn_like(router_logits) * self.exploration_noise_std
+            router_logits = router_logits + noise
+
+            # Apply dropout to router logits during training for exploration
+            drop_mask = torch.bernoulli(
+                torch.full_like(router_logits, self.p_keep)
+            )
+            router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)
+    
             
             #router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
-            router_weights = F.gumbel_softmax(scaled_logits, tau=self.temperature, hard=False)
+            router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
+            
 
-        
+    
             # Anneal temperature during training
             if self.training:
                 self.temperature = max(
@@ -565,7 +581,6 @@ class SoftHardMOE(FeaturesExtractor):
                 )
         
         self.step_count += 1
-            
 
         # Process ALL experts (soft routing - no information loss)
         self.preprocess_input(observations)  # Processes all skills
