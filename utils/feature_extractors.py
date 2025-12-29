@@ -345,42 +345,46 @@ class SoftHardMOE(FeaturesExtractor):
         context = get_embedding_for_context(observations, self.encoder)
         router_logits = self.router(context)  # (batch_size, num_experts)
         
-        if self.step_count < self.router_warmup_steps:
-            # Uniform routing - all skills contribute equally
-            router_logits = router_logits.detach()
-            router_weights = torch.ones_like(router_logits) / self.num_experts
-        else:
-            router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
+        # if self.step_count < self.router_warmup_steps:
+        #     # Uniform routing - all skills contribute equally
+        #     router_logits = router_logits.detach()
+        #     router_weights = torch.ones_like(router_logits) / self.num_experts
             
-            # Calculate entropy of routing distribution (per sample in batch)
-            entropy = -torch.sum(router_weights * torch.log(router_weights + 1e-10), dim=1)
+        #     # here self.routing_entropy is maximum (uniform distribution)
+        #     self.routing_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
             
-            # Store for auxiliary loss
-            self.routing_entropy = entropy.mean()
-            
-            # Apply EMA smoothing (prevents drastic changes)
-            if self.ema_weights is None:
-                # First step after warmup: initialize with current weights
-                self.ema_weights = router_weights.detach().mean(dim=0)  # Average over batch
-            else:
-                # Smooth: new_weights = alpha * old + (1-alpha) * new
-                batch_mean_weights = router_weights.detach().mean(dim=0)
-                self.ema_weights = self.ema_alpha * self.ema_weights + (1 - self.ema_alpha) * batch_mean_weights
+        # else:
+        router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
         
-            
-            router_weights = self.smoothing_factor * self.ema_weights.unsqueeze(0) + (1 - self.smoothing_factor) * router_weights
-            
-            if self.training:
-                # Apply dropout to router logits during training for exploration
-                drop_mask = torch.bernoulli(
-                    torch.full_like(router_logits, self.p_keep)
-                )
-                router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)    
-                
-            self.temperature = max(
-                self.min_temperature,
-                self.temperature * self.temperature_decay
+        # Calculate entropy of routing distribution (per sample in batch)
+        entropy = -torch.sum(router_weights * torch.log(router_weights + 1e-10), dim=1)
+        
+        # Store for auxiliary loss
+        self.routing_entropy = entropy.mean()
+        
+        # Apply EMA smoothing (prevents drastic changes)
+        if self.ema_weights is None:
+            # First step after warmup: initialize with current weights
+            self.ema_weights = router_weights.detach().mean(dim=0)  # Average over batch
+        else:
+            # Smooth: new_weights = alpha * old + (1-alpha) * new
+            batch_mean_weights = router_weights.detach().mean(dim=0)
+            self.ema_weights = self.ema_alpha * self.ema_weights + (1 - self.ema_alpha) * batch_mean_weights
+    
+        
+        router_weights = self.smoothing_factor * self.ema_weights.unsqueeze(0) + (1 - self.smoothing_factor) * router_weights
+        
+        if self.training:
+            # Apply dropout to router logits during training for exploration
+            drop_mask = torch.bernoulli(
+                torch.full_like(router_logits, self.p_keep)
             )
+            router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)    
+            
+        self.temperature = max(
+            self.min_temperature,
+            self.temperature * self.temperature_decay
+        )
         
         self.step_count += 1
 
