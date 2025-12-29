@@ -18,7 +18,7 @@ from skills.unsupervised_state_representation import UnsupervisedStateRepresenta
 from skills.video_object_keypoints import Transporter
 from skills.video_object_segmentation import VideoObjectSegmentationModel
 
-from utils.feature_extractors import WeightSharingAttentionExtractor, MixtureOfExpertsExtractor, SoftHardMOE
+from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
 from utils.custom_ppo import CustomPPO
 from utils.monitor_moe_weights import GatingMonitorCallback
 

@@ -179,15 +179,6 @@ class CustomPPO(PPO):
                 # Standard PPO loss
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
-                # Add auxiliary loss from feature extractor (e.g., MoE load balancing)
-                if has_aux_loss:
-                    try:
-                        aux_loss = self.policy.features_extractor.get_auxiliary_loss()
-                        loss = loss + aux_loss
-                        aux_losses.append(aux_loss.item())
-                    except Exception as e:
-                        raise RuntimeError(f"Error computing auxiliary loss: {e}")
-
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419

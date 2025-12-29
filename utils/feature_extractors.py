@@ -232,211 +232,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         return att_out
 
 
-class MixtureOfExpertsExtractor(FeaturesExtractor):
-    def __init__(
-        self,
-        observation_space: spaces.Box,
-        features_dim: int = 256,
-        skills: List[Skill] | None = None,
-        device="cpu",
-        top_k: int = 2,  # number of experts to activate
-        exploration_noise_std: float = 0.1,  # noise level for exploration (0.01-0.1 recommended)
-        load_balance_coef: float = 0.01,  # coefficient for load balancing loss
-    ):
-        """
-
-        Mixture of Experts feature extractor that selectively activates only top-k skills based on router decision.
-        :param observation_space: Gymnasium observation space
-        :param features_dim: Number of features extracted from the observations
-        :param skills: List of skill objects (experts)
-        :param device: Device used for computation
-        :param top_k: Number of top experts to activate (default: 2)
-        :param exploration_noise_std: Standard deviation of Gaussian noise added to router logits during training (default: 0.1)
-        :param load_balance_coef: Coefficient for load balancing auxiliary loss to encourage expert diversity (default: 0.01)
-        """
-
-        super().__init__(observation_space, features_dim, skills, device)
-
-        self.device = device
-
-        self.top_k = min(top_k, len(skills)) if skills else top_k
-        self.exploration_noise_std = exploration_noise_std
-        self.load_balance_coef = load_balance_coef
-        self.num_experts = len(skills)
-
-        sample = observation_space.sample()  # 4x84x84
-        sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
-        sample = torch.from_numpy(sample) / 255
-        sample = sample.to(device)
-
-        # Context encoder for routing decisions
-        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
-        model = Autoencoder().to(device)
-        model = torch.compile(model, mode="reduce-overhead")
-        model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
-        model.eval()
-        self.encoder = model.encoder
-        
-        
-        z = get_embedding_for_context(sample, self.encoder)
-        self.input_size = z.shape[-1]
-
-        # Router network: takes context and outputs logits for each expert
-
-        self.router = nn.Sequential(
-            nn.Linear(self.input_size, features_dim, device=device),
-            nn.ReLU(),
-            nn.Linear(features_dim, len(self.skills), device=device),
-        )
-
-        # MLP layers for each skill to project to features_dim
-        self.preprocess_input(sample)  # populate self.skills_embeddings
-        
-        self.mlp_layers = nn.ModuleList()
-        for i in range(len(self.skills_embeddings)):
-            seq_layer = nn.Sequential(
-                nn.Linear(
-                    self.skills_embeddings[i].shape[1], features_dim, device=device
-                ),
-                nn.LayerNorm(features_dim),
-                nn.ReLU(),
-            )
-
-            self.mlp_layers.append(seq_layer)
-
-        # Tracking
-        self.expert_weights = {}
-        self.selected_experts = []
-        self.training_weights = []
-        self.load_balance_loss = torch.tensor(0.0, device=device)  # stores last computed load balance loss
-         
-
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        observations = observations.to(self.device) 
-         
-        batch_size = observations.shape[0]
-
-        context = get_embedding_for_context(observations, self.encoder)
-        router_logits = self.router(context)  # (batch_size, num_experts)
-        
-        # Store router probabilities for load balancing loss (before noise)
-        router_probs = torch.softmax(router_logits, dim=1)  # (batch_size, num_experts)
-        
-        if self.training and self.exploration_noise_std > 0:
-            # Add Gaussian noise to logits for exploration
-            # Reduced from 1.0 to 0.1 default - high noise destabilizes learning
-            noise = torch.randn_like(router_logits) * self.exploration_noise_std
-            router_logits = router_logits + noise
-
-        top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
-
-        # Normalize weights using softmax only over selected experts
-        top_k_weights = torch.softmax(top_k_values, dim=1)  # (batch_size, top_k)
-
-        # Store weights for tracking (sparse representation)
-        all_weights = torch.zeros(batch_size, len(self.skills), device=self.device)
-        all_weights.scatter_(1, top_k_indices, top_k_weights)
-        
-        # Find unique experts selected across the entire batch
-        unique_experts = torch.unique(top_k_indices).tolist()
-
-        # Process all unique experts for the ENTIRE batch at once using preprocess_input
-        self.preprocess_input(observations, skill_indices=unique_experts)
-
-        # Now combine expert outputs using per-sample weights
-        output = torch.zeros(batch_size, self.features_dim, device=self.device)
-
-
-        for i, expert_idx in enumerate(unique_experts):
-            # Get the skill embedding for all samples (already computed)
-            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
-
-            # Project through MLP (trainable)
-            skill_embedding = self.mlp_layers[expert_idx](skill_embedding)  # (batch_size, features_dim)
-
-            # Get per-sample weights for this expert
-            expert_weights = all_weights[:, expert_idx]  # (batch_size,)
-
-            # Weight and accumulate
-            weighted_output = skill_embedding * expert_weights.unsqueeze(1)  # (batch_size, features_dim)
-
-            output += weighted_output
-
-        # Compute load balancing loss to encourage expert diversity
-        if self.training:
-            self.load_balance_loss = self._compute_load_balance_loss(router_probs, top_k_indices)
-        
-        # Store weights for visualization
-        self.training_weights.append(all_weights.detach())
-        for i, skill in enumerate(self.skills):
-            self.expert_weights[skill.name] = all_weights[:, i].detach().cpu().tolist()
-
-        return output
-    
-    def _compute_load_balance_loss(
-        self, 
-        router_probs: torch.Tensor, 
-        top_k_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute load balancing auxiliary loss to encourage uniform expert utilization.
-        
-        Based on "Switch Transformers" paper (Fedus et al., 2021):
-        loss = num_experts * sum_i(f_i * P_i)
-        
-        where:
-        - f_i = fraction of samples routed to expert i (how often expert i is selected)
-        - P_i = mean routing probability for expert i (router's confidence for expert i)
-        
-        This loss is minimized when experts are used equally often AND 
-        the router assigns similar probabilities to all experts.
-        
-        :param router_probs: Router softmax probabilities (batch_size, num_experts)
-        :param top_k_indices: Indices of selected top-k experts (batch_size, top_k)
-        :return: Load balancing loss scalar
-        """
-        batch_size = router_probs.shape[0]
-        
-        # Compute P_i: mean router probability for each expert across the batch
-        mean_router_probs = router_probs.mean(dim=0)  # (num_experts,)
-        
-        # Compute f_i: fraction of samples that route to each expert
-        # Create one-hot encoding of selected experts
-        expert_mask = torch.zeros(
-            batch_size, 
-            self.num_experts, 
-            device=self.device
-        )
-        
-        # Mark which experts were selected (any of top-k)
-        for k in range(self.top_k):
-            expert_mask.scatter_(1, top_k_indices[:, k:k+1], 1.0)
-        
-        # Compute fraction: how many samples selected each expert
-        expert_usage_fraction = expert_mask.sum(dim=0) / batch_size  # (num_experts,)
-        
-        # Load balance loss: encourages both uniform usage AND uniform probabilities
-        # Multiply by num_experts to scale appropriately
-        load_balance_loss = self.num_experts * torch.sum(
-            expert_usage_fraction * mean_router_probs
-        )
-        
-        # Scale by coefficient (typically 0.01)
-        return self.load_balance_coef * load_balance_loss
-    
-    def get_auxiliary_loss(self) -> torch.Tensor:
-        """
-        Get the auxiliary load balancing loss to be added to the main PPO loss.
-        
-        Usage in PPO training loop:
-            # After computing PPO loss
-            aux_loss = model.policy.features_extractor.get_auxiliary_loss()
-            total_loss = ppo_loss + aux_loss
-        
-        :return: Load balancing loss tensor (scalar)
-        """
-        return self.load_balance_loss
     
     
     
@@ -456,7 +251,7 @@ class SoftHardMOE(FeaturesExtractor):
         initial_temperature: float = 1.0,  # Start with soft routing
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
-        router_warmup_steps: int = 15000,  # Steps before starting annealing
+        router_warmup_steps: int = 100,  # Steps before starting annealing
         exploration_noise_std: float = 0.3, # noise level for exploration
     ):
         """
@@ -489,7 +284,11 @@ class SoftHardMOE(FeaturesExtractor):
         self.router_warmup_steps = router_warmup_steps
         self.step_count = 0
         
-        self.p_keep = 0.7  # Probability to keep each expert active during training
+        self.p_keep = 0.8  # Probability to keep each expert active during training
+        # EMA for temporal smoothing
+        self.ema_alpha = 0.95  # Smoothing factor (0.9 = heavy smoothing)
+        self.register_buffer('ema_weights', None)  # Persistent across forward passes
+        self.smoothing_factor = 0.8
 
         self.num_experts = len(skills)
 
@@ -554,30 +353,31 @@ class SoftHardMOE(FeaturesExtractor):
             router_logits = router_logits.detach()
             router_weights = torch.ones_like(router_logits) / self.num_experts
         else:
+            router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
             
-                
-            noise = torch.randn_like(router_logits) * self.exploration_noise_std
-            router_logits = router_logits + noise
-
-            scaled_logits = router_logits / self.temperature
+            # Apply EMA smoothing (prevents drastic changes)
+            if self.ema_weights is None:
+                # First step after warmup: initialize with current weights
+                self.ema_weights = router_weights.detach().mean(dim=0)  # Average over batch
+            else:
+                # Smooth: new_weights = alpha * old + (1-alpha) * new
+                batch_mean_weights = router_weights.detach().mean(dim=0)
+                self.ema_weights = self.ema_alpha * self.ema_weights + (1 - self.ema_alpha) * batch_mean_weights
+        
             
-            # Apply dropout to router logits during training for exploration
-            drop_mask = torch.bernoulli(
-                torch.full_like(scaled_logits, self.p_keep)
-            )
-            router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)
-    
+            router_weights = self.smoothing_factor * self.ema_weights.unsqueeze(0) + (1 - self.smoothing_factor) * router_weights
             
-            #router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
-            router_weights = F.gumbel_softmax(scaled_logits, tau=self.temperature, hard=False)
-            
-
-            # Anneal temperature during training
             if self.training:
-                self.temperature = max(
-                    self.min_temperature,
-                    self.temperature * self.temperature_decay
+                # Apply dropout to router logits during training for exploration
+                drop_mask = torch.bernoulli(
+                    torch.full_like(router_logits, self.p_keep)
                 )
+                router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)    
+                
+            self.temperature = max(
+                self.min_temperature,
+                self.temperature * self.temperature_decay
+            )
         
         self.step_count += 1
 
