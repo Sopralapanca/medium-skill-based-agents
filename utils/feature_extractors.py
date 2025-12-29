@@ -252,7 +252,6 @@ class SoftHardMOE(FeaturesExtractor):
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
         router_warmup_steps: int = 100,  # Steps before starting annealing
-        exploration_noise_std: float = 0.3, # noise level for exploration
     ):
         """
         Mixture of Experts with soft-to-hard routing transition.
@@ -274,9 +273,7 @@ class SoftHardMOE(FeaturesExtractor):
         super().__init__(observation_space, features_dim, skills, device)
 
         self.device = device
-        
-        self.exploration_noise_std = exploration_noise_std
-        
+                
         # Temperature annealing parameters
         self.temperature = initial_temperature
         self.min_temperature = min_temperature
@@ -355,6 +352,12 @@ class SoftHardMOE(FeaturesExtractor):
         else:
             router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
             
+            # Calculate entropy of routing distribution (per sample in batch)
+            entropy = -torch.sum(router_weights * torch.log(router_weights + 1e-10), dim=1)
+            
+            # Store for auxiliary loss
+            self.routing_entropy = entropy.mean()
+            
             # Apply EMA smoothing (prevents drastic changes)
             if self.ema_weights is None:
                 # First step after warmup: initialize with current weights
@@ -404,3 +407,15 @@ class SoftHardMOE(FeaturesExtractor):
         self.training_weights.append(router_weights.detach())
     
         return output
+    
+def get_auxiliary_loss(self) -> torch.Tensor:
+    """Called by CustomPPO during training"""
+    if not hasattr(self, 'routing_entropy'):
+        return torch.tensor(0.0, device=self.device)
+    
+    # Penalize low entropy (encourages diverse routing)
+    # Higher entropy = more uniform distribution
+    entropy_loss = -self.routing_entropy  # Negative = maximize entropy
+    
+    # Weight this loss (tune this coefficient)
+    return 0.01 * entropy_loss
