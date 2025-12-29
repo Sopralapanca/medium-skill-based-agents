@@ -413,13 +413,30 @@ class SoftHardMOE(FeaturesExtractor):
         return output
     
 def get_auxiliary_loss(self) -> torch.Tensor:
-    """Called by CustomPPO during training"""
-    if not hasattr(self, 'routing_entropy'):
+    """entropy and load balancing loss for the router"""
+    
+    if not hasattr(self, 'training_weights') or len(self.training_weights) == 0 or not hasattr(self, 'routing_entropy'):
         return torch.tensor(0.0, device=self.device)
+
     
     # Penalize low entropy (encourages diverse routing)
     # Higher entropy = more uniform distribution
     entropy_loss = -self.routing_entropy  # Negative = maximize entropy
+    coefficient = 0.1 
+    entropy_loss = coefficient * entropy_loss
+
     
-    # Weight this loss (tune this coefficient)
-    return 0.01 * entropy_loss
+    # Get recent routing decisions (last N batches)
+    recent_weights = torch.cat(self.training_weights[-100:], dim=0)  # Shape: [batch*10, num_experts]
+    
+    # Calculate average usage per expert
+    avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
+    
+    # Target: each expert used equally (1/num_experts)
+    target_usage = 1.0 / self.num_experts
+    
+    # Penalize deviation from uniform usage
+    load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
+    load_balance_coefficient = 0.1
+    
+    return entropy_loss + load_balance_coefficient * load_balance_loss 
