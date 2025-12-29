@@ -456,7 +456,7 @@ class SoftHardMOE(FeaturesExtractor):
         initial_temperature: float = 1.0,  # Start with soft routing
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
-        router_warmup_steps: int = 50000,  # Steps before starting annealing
+        router_warmup_steps: int = 15000,  # Steps before starting annealing
         exploration_noise_std: float = 0.3, # noise level for exploration
     ):
         """

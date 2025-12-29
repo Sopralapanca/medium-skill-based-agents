@@ -19,6 +19,18 @@ class GatingMonitorCallback(BaseCallback):
         
         os.makedirs(save_path, exist_ok=True)
         
+    def save_weights(self):
+        # Save the complete history
+        save_data = {
+            'timesteps': self.timesteps,
+            'weights': self.all_weights,
+            'skill_names': [skill.name for skill in self.feature_extractor.skills]
+        }
+        
+        save_file = os.path.join(self.save_path, f"gating_weights_{self.env}.pkl")
+        with open(save_file, 'wb') as f:
+            pickle.dump(save_data, f)
+        
     def _on_step(self) -> bool:
         # Save weights periodically
         if self.n_calls % self.save_freq == 0:
@@ -30,6 +42,8 @@ class GatingMonitorCallback(BaseCallback):
                 
                 # Clear the buffer to avoid memory issues
                 self.feature_extractor.training_weights = []
+                
+                self.save_weights()
                 
                 if self.verbose > 0:
                     total_samples = sum(w.shape[0] for w in weights)
@@ -45,16 +59,7 @@ class GatingMonitorCallback(BaseCallback):
             self.all_weights.append(weights)
             self.timesteps.append(self.num_timesteps)
         
-        # Save the complete history
-        save_data = {
-            'timesteps': self.timesteps,
-            'weights': self.all_weights,
-            'skill_names': [skill.name for skill in self.feature_extractor.skills]
-        }
-        
-        save_file = os.path.join(self.save_path, f"gating_weights_{self.env}.pkl")
-        with open(save_file, 'wb') as f:
-            pickle.dump(save_data, f)
+        self.save_weights()
     
 
 
