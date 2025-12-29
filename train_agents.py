@@ -194,29 +194,20 @@ skills = [
 ]
    
 
-# f_ext_kwargs = environment_configuration["f_ext_kwargs"]
-# environment_configuration["f_ext_name"] = "moe_ext"
-# environment_configuration["f_ext_class"] = SoftHardMOE
-# f_ext_kwargs["skills"] = skills
-# f_ext_kwargs["features_dim"] = 256
-
-# # Exploration and load balancing parameters
-# f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
-# f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
-
-
-# policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
-# policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
-
-
-
 f_ext_kwargs = environment_configuration["f_ext_kwargs"]
-environment_configuration["f_ext_name"] = "wsharing_attention_ext"
-environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
+environment_configuration["f_ext_name"] = "moe_ext"
+environment_configuration["f_ext_class"] = SoftHardMOE
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
 
+# Exploration and load balancing parameters
+f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
+f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
+
+
 policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
+
+
 
 train_agent(env, environment_configuration, policy_kwargs, seed, train_steps=5000, wandb=False)

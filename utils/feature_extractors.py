@@ -456,7 +456,7 @@ class SoftHardMOE(FeaturesExtractor):
         initial_temperature: float = 1.0,  # Start with soft routing
         min_temperature: float = 0.1,      # End with nearly-hard routing
         temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
-        router_warmup_steps: int = 100000,  # Steps before starting annealing
+        router_warmup_steps: int = 50000,  # Steps before starting annealing
         exploration_noise_std: float = 0.3, # noise level for exploration
     ):
         """
@@ -490,8 +490,6 @@ class SoftHardMOE(FeaturesExtractor):
         self.step_count = 0
         
         self.p_keep = 0.7  # Probability to keep each expert active during training
-        
-
 
         self.num_experts = len(skills)
 
@@ -514,10 +512,10 @@ class SoftHardMOE(FeaturesExtractor):
 
         # Router network: takes context and outputs logits for each expert
         self.router = nn.Sequential(
-            nn.Linear(self.input_size, features_dim // 2, device=device),
+            nn.Linear(self.input_size, features_dim, device=device),
             nn.ReLU(),
             nn.Dropout(p=0.1),
-            nn.Linear(features_dim // 2, len(self.skills), device=device),
+            nn.Linear(features_dim, len(self.skills), device=device),
         )
         
         # Initialize router to output near-uniform logits
@@ -561,18 +559,19 @@ class SoftHardMOE(FeaturesExtractor):
             noise = torch.randn_like(router_logits) * self.exploration_noise_std
             router_logits = router_logits + noise
 
+            scaled_logits = router_logits / self.temperature
+            
             # Apply dropout to router logits during training for exploration
             drop_mask = torch.bernoulli(
-                torch.full_like(router_logits, self.p_keep)
+                torch.full_like(scaled_logits, self.p_keep)
             )
             router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)
     
             
             #router_weights = torch.softmax(scaled_logits, dim=1)  # (batch_size, num_experts)
-            router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
+            router_weights = F.gumbel_softmax(scaled_logits, tau=self.temperature, hard=False)
             
 
-    
             # Anneal temperature during training
             if self.training:
                 self.temperature = max(
