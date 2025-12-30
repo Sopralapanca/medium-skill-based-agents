@@ -412,31 +412,35 @@ class SoftHardMOE(FeaturesExtractor):
     
         return output
     
-def get_auxiliary_loss(self) -> torch.Tensor:
-    """entropy and load balancing loss for the router"""
-    
-    if not hasattr(self, 'training_weights') or len(self.training_weights) == 0 or not hasattr(self, 'routing_entropy'):
-        return torch.tensor(0.0, device=self.device)
+    def get_auxiliary_loss(self) -> torch.Tensor:
+        """Entropy and load balancing loss for the router.
+        
+        Returns a non-negative penalty that:
+        - Is HIGH when routing collapses (low entropy, imbalanced usage)
+        - Is LOW when routing is diverse (high entropy, balanced usage)
+        """
+        
+        if not hasattr(self, 'training_weights') or len(self.training_weights) == 0 or not hasattr(self, 'routing_entropy'):
+            return torch.tensor(0.0, device=self.device)
 
-    
-    # Penalize low entropy (encourages diverse routing)
-    # Higher entropy = more uniform distribution
-    entropy_loss = -self.routing_entropy  # Negative = maximize entropy
-    coefficient = 0.1 
-    entropy_loss = coefficient * entropy_loss
-
-    
-    # Get recent routing decisions (last N batches)
-    recent_weights = torch.cat(self.training_weights[-100:], dim=0)  # Shape: [batch*10, num_experts]
-    
-    # Calculate average usage per expert
-    avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
-    
-    # Target: each expert used equally (1/num_experts)
-    target_usage = 1.0 / self.num_experts
-    
-    # Penalize deviation from uniform usage
-    load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
-    load_balance_coefficient = 0.1
-    
-    return entropy_loss + load_balance_coefficient * load_balance_loss 
+        # 1. Entropy regularization: penalize distance from maximum entropy
+        # Maximum entropy for uniform distribution over N experts: log(N)
+        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
+        
+        # Penalty is 0 when entropy is maximum (diverse), increases as entropy drops (collapsed)
+        entropy_penalty = max_entropy - self.routing_entropy
+        entropy_coefficient = 0.01  # Tune this: higher = stronger diversity pressure
+        entropy_loss = entropy_coefficient * entropy_penalty
+        
+        # # 2. Load balancing: penalize deviation from uniform expert usage
+        # recent_weights = torch.cat(self.training_weights[-100:], dim=0)  # Shape: [batch*N, num_experts]
+        # avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
+        
+        # # Target: each expert used equally (1/num_experts)
+        # target_usage = 1.0 / self.num_experts
+        # load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
+        # load_balance_coefficient = 0.1  # Tune this: higher = stronger balancing pressure
+        
+        # total_aux_loss = entropy_loss + load_balance_coefficient * load_balance_loss
+        
+        return entropy_loss 

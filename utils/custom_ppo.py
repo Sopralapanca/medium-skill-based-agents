@@ -117,11 +117,7 @@ class CustomPPO(PPO):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
-        aux_losses = []  # Track auxiliary losses
-
-        # Check if feature extractor has auxiliary loss
-        has_aux_loss = hasattr(self.policy.features_extractor, 'get_auxiliary_loss')
-
+        auxiliary_losses = []  # Track auxiliary losses from feature extractor        
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -179,14 +175,11 @@ class CustomPPO(PPO):
                 # Standard PPO loss
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
                 
-                if has_aux_loss:
-                    try:
-                        aux_loss = self.policy.features_extractor.get_auxiliary_loss()
-                        aux_losses.append(aux_loss.item())
-                        # Add auxiliary loss to total loss
-                        loss += aux_loss
-                    except Exception as e:
-                        raise RuntimeError("Error computing auxiliary loss from feature extractor.") from e
+                # Add auxiliary loss from feature extractor (e.g., MoE load balancing)
+                if hasattr(self.policy.features_extractor, 'get_auxiliary_loss'):
+                    aux_loss = self.policy.features_extractor.get_auxiliary_loss()
+                    loss = loss + aux_loss
+                    auxiliary_losses.append(aux_loss.item())
                     
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
@@ -227,8 +220,8 @@ class CustomPPO(PPO):
         self.logger.record("train/explained_variance", explained_var)
         
         # Log auxiliary loss if available
-        if has_aux_loss and aux_losses:
-            self.logger.record("train/auxiliary_loss", np.mean(aux_losses))
+        if auxiliary_losses:
+            self.logger.record("train/auxiliary_loss", np.mean(auxiliary_losses))
         
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
