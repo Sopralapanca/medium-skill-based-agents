@@ -234,13 +234,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
     
     
-    
-    
-    
-    
-    
-    
-    
 class SoftHardMOE(FeaturesExtractor):
     def __init__(
         self,
@@ -248,10 +241,6 @@ class SoftHardMOE(FeaturesExtractor):
         features_dim: int = 256,
         skills: List[Skill] | None = None,
         device="cpu",
-        initial_temperature: float = 1.0,  # Start with soft routing
-        min_temperature: float = 0.1,      # End with nearly-hard routing
-        temperature_decay: float = 0.99995,  # Gradual annealing (tune this!)
-        router_warmup_steps: int = 100,  # Steps before starting annealing
     ):
         """
         Mixture of Experts with soft-to-hard routing transition.
@@ -260,28 +249,21 @@ class SoftHardMOE(FeaturesExtractor):
         :param features_dim: Number of features extracted from the observations
         :param skills: List of skill objects (experts)
         :param device: Device used for computation
-        :param initial_temperature: Starting temperature (1.0 = soft, uniform routing)
-        :param min_temperature: Minimum temperature (0.1 = nearly hard routing)
-        :param temperature_decay: Decay rate per forward pass (0.99995 recommended for 1M steps)
-        
-        Temperature annealing schedule:
-        - At temp=1.0: Router weights are soft, all experts contribute
-        - At temp=0.1: Router weights are sharp, dominant expert(s) take over
-        - Decay of 0.99995 reaches min_temp after ~460k forward passes
         """
 
         super().__init__(observation_space, features_dim, skills, device)
 
         self.device = device
-                
-        # Temperature annealing parameters
-        self.temperature = initial_temperature
-        self.min_temperature = min_temperature
-        self.temperature_decay = temperature_decay
-        self.router_warmup_steps = router_warmup_steps
-        self.step_count = 0
         
+        # temperature annealing parameters
+        self.temperature = 1.0  # Start with soft routing
+        self.min_temperature = 0.1      # End with nearly-hard routing
+        self.temperature_decay = 0.99998  # Gradual annealing (tune this!)
+        self.step_count = 0
+               
+        # expert dropout parameters
         self.p_keep = 0.8  # Probability to keep each expert active during training
+        
         # EMA for temporal smoothing
         self.ema_alpha = 0.95  # Smoothing factor (0.9 = heavy smoothing)
         self.register_buffer('ema_weights', None)  # Persistent across forward passes
@@ -345,15 +327,7 @@ class SoftHardMOE(FeaturesExtractor):
         context = get_embedding_for_context(observations, self.encoder)
         router_logits = self.router(context)  # (batch_size, num_experts)
         
-        # if self.step_count < self.router_warmup_steps:
-        #     # Uniform routing - all skills contribute equally
-        #     router_logits = router_logits.detach()
-        #     router_weights = torch.ones_like(router_logits) / self.num_experts
-            
-        #     # here self.routing_entropy is maximum (uniform distribution)
-        #     self.routing_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
-            
-        # else:
+        # Compute routing weights with Gumbel-Softmax
         router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
         
         # Calculate entropy of routing distribution (per sample in batch)
@@ -362,7 +336,7 @@ class SoftHardMOE(FeaturesExtractor):
         # Store for auxiliary loss
         self.routing_entropy = entropy.mean()
         
-        # Apply EMA smoothing (prevents drastic changes)
+        #Apply EMA smoothing (prevents drastic changes)
         if self.ema_weights is None:
             # First step after warmup: initialize with current weights
             self.ema_weights = router_weights.detach().mean(dim=0)  # Average over batch
@@ -371,16 +345,19 @@ class SoftHardMOE(FeaturesExtractor):
             batch_mean_weights = router_weights.detach().mean(dim=0)
             self.ema_weights = self.ema_alpha * self.ema_weights + (1 - self.ema_alpha) * batch_mean_weights
     
-        
         router_weights = self.smoothing_factor * self.ema_weights.unsqueeze(0) + (1 - self.smoothing_factor) * router_weights
         
+        # Apply expert dropout AFTER EMA smoothing (only during training)
+        # This ensures dropped experts are truly zeroed out
         if self.training:
-            # Apply dropout to router logits during training for exploration
             drop_mask = torch.bernoulli(
-                torch.full_like(router_logits, self.p_keep)
+                torch.full((batch_size, self.num_experts), self.p_keep, device=self.device)
             )
-            router_logits = router_logits.masked_fill(drop_mask == 0, -1e9)    
+            router_weights = router_weights * drop_mask
+            # Re-normalize so weights still sum to 1
+            router_weights = router_weights / (router_weights.sum(dim=1, keepdim=True) + 1e-10)
             
+        # Anneal temperature for soft-to-hard transition
         self.temperature = max(
             self.min_temperature,
             self.temperature * self.temperature_decay
@@ -429,18 +406,26 @@ class SoftHardMOE(FeaturesExtractor):
         
         # Penalty is 0 when entropy is maximum (diverse), increases as entropy drops (collapsed)
         entropy_penalty = max_entropy - self.routing_entropy
-        entropy_coefficient = 0.01  # Tune this: higher = stronger diversity pressure
+        entropy_coefficient = 0.01
         entropy_loss = entropy_coefficient * entropy_penalty
         
-        # # 2. Load balancing: penalize deviation from uniform expert usage
-        # recent_weights = torch.cat(self.training_weights[-100:], dim=0)  # Shape: [batch*N, num_experts]
-        # avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
-        
-        # # Target: each expert used equally (1/num_experts)
-        # target_usage = 1.0 / self.num_experts
-        # load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
-        # load_balance_coefficient = 0.1  # Tune this: higher = stronger balancing pressure
-        
-        # total_aux_loss = entropy_loss + load_balance_coefficient * load_balance_loss
-        
         return entropy_loss 
+    
+    # def get_auxiliary_loss(self) -> torch.Tensor:
+    #     """Load balancing loss to prevent expert collapse"""
+    #     if not hasattr(self, 'training_weights') or len(self.training_weights) == 0:
+    #         return torch.tensor(0.0, device=self.device)
+        
+    #     # Get recent routing decisions (last N batches)
+    #     recent_weights = torch.cat(self.training_weights[-500:], dim=0)  # Shape: [batch*10, num_experts]
+        
+    #     # Calculate average usage per expert
+    #     avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
+        
+    #     # Target: each expert used equally (1/num_experts)
+    #     target_usage = 1.0 / self.num_experts
+        
+    #     # Penalize deviation from uniform usage
+    #     load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
+        
+    #     return 0.01 * load_balance_loss  # Tune coefficient

@@ -4,6 +4,7 @@ import yaml
 import numpy as np
 import random
 import os
+import sys
 
 # training imports
 from stable_baselines3.common.env_util import make_atari_env
@@ -68,7 +69,7 @@ def init_wandb(environment_configuration):
   return run
 
 
-def train_agent(env_id, configs, policy_kwargs, seed, train_steps=5000, wandb=False):
+def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=5000, wandb=False):
     if wandb:
         run = init_wandb(configs)
         monitor_dir = str(run.id)
@@ -129,13 +130,17 @@ def train_agent(env_id, configs, policy_kwargs, seed, train_steps=5000, wandb=Fa
             feature_extractor=feature_extractor,
             env=env_id,
             save_freq=500,  # Save every 500 steps
+            run_id=run_id,
             save_path="./gating_weights",
             verbose=0
         )
         
         callbacks.append(gating_monitor)
-        
-    model.learn(train_steps, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
+    try:    
+        model.learn(train_steps, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
+    except KeyboardInterrupt:
+        gating_monitor._on_training_end()
+        sys.exit(0)
     
     if run is not None:
         run.finish()
@@ -200,14 +205,17 @@ environment_configuration["f_ext_class"] = SoftHardMOE
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
 
-# Exploration and load balancing parameters
-f_ext_kwargs["min_temperature"] = 0.1  # Try 0.01, 0.05, 0.1, 0.2
-f_ext_kwargs["temperature_decay"] = 0.99998    # Try 0.001, 0.01, 0.05
-f_ext_kwargs["router_warmup_steps"] = 10
-
 policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
 
 
-train_agent(env, environment_configuration, policy_kwargs, seed, train_steps=2000, wandb=False)
+train_agent(
+    env, 
+    environment_configuration, 
+    policy_kwargs, 
+    seed, 
+    run_id="entropy_loss_expert_dropout_ema_smoothing", 
+    train_steps=10000000, 
+    wandb=True
+    )

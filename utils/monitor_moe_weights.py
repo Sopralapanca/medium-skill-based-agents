@@ -8,7 +8,7 @@ class GatingMonitorCallback(BaseCallback):
     """
     Callback to monitor and save gating distribution during training
     """
-    def __init__(self, feature_extractor, env, save_freq=1000, save_path="./gating_weights", verbose=0):
+    def __init__(self, feature_extractor, env, run_id, save_freq=1000, save_path="./gating_weights", verbose=0):
         super().__init__(verbose)
         self.feature_extractor = feature_extractor
         self.save_freq = save_freq
@@ -16,6 +16,7 @@ class GatingMonitorCallback(BaseCallback):
         self.timesteps = []
         self.all_weights = []
         self.env = env
+        self.run_id = run_id
         
         os.makedirs(save_path, exist_ok=True)
         
@@ -27,7 +28,7 @@ class GatingMonitorCallback(BaseCallback):
             'skill_names': [skill.name for skill in self.feature_extractor.skills]
         }
         
-        save_file = os.path.join(self.save_path, f"gating_weights_{self.env}.pkl")
+        save_file = os.path.join(self.save_path, f"gating_weights_{self.env}_{self.run_id}.pkl")
         with open(save_file, 'wb') as f:
             pickle.dump(save_data, f)
         
