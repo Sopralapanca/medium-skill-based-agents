@@ -16,19 +16,30 @@ dependencies = [
     "ipywidgets>=8.1.8",
     "kornia>=0.8.2",
     "moviepy>=2.2.1",
+    "numpy==1.26.4",
     "opencv-python>=4.11.0.86",
     "pyyaml>=6.0.3",
+    "pufferlib",
     "rl-zoo3>=2.7.0",
     "scikit-learn>=1.8.0",
     "shimmy>=0.2.1",
     "stable-baselines3[extra]>=2.7.1",
     "tensorflow>=2.20.0",
+    "torch>=2.9.1",
     "torchvision>=0.24.1",
     "wandb>=0.23.1",
 ]
 
 [tool.uv.sources]
 atariari = { git = "https://github.com/Sopralapanca/atari-representation-learning.git" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+pufferlib = {git = "https://github.com/PufferAI/PufferLib.git" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 
 [build-system]
