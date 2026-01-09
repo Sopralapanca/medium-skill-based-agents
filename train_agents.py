@@ -21,7 +21,7 @@ from skills.video_object_segmentation import VideoObjectSegmentationModel
 
 from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
 from utils.custom_ppo import CustomPPO
-from utils.monitor_moe_weights import GatingMonitorCallback
+from utils.monitor_weights import GatingMonitorCallback
 
 # IMPORTANT - REGISTER THE ENVIRONMENTS
 import gymnasium as gym

@@ -9,9 +9,10 @@ ENVS:
   - MsPacmanNoFrameskip-v4
 
 # Dataset / common parameters
-#EPISODES: 100
+EPISODES: 10000
 MAX_STEPS_PER_EPISODE_RANDOM_AGENT: 100
 MAX_STEPS_PER_EPISODE_EXPERT_AGENT: 1000
+TOTAL_FRAMES_PER_ENV: 20000
 
 # Shared paths and preprocessing
 data_path: ./data
