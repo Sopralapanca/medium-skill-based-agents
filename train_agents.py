@@ -216,6 +216,6 @@ train_agent(
     policy_kwargs, 
     seed, 
     run_id="entropy_loss_expert_dropout_ema_smoothing", 
-    train_steps=10000000, 
-    wandb=True
-    )
+    train_steps=1000000, 
+    wandb=False
+)

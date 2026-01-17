@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ale-py>=0.11.2",
     "atariari",
-    "gym>=0.26.2",
+    "gym==0.23",
     "gymnasium[atari]>=1.2.3",
     "huggingface-hub>=0.36.0",
     "huggingface-sb3>=3.0",
