@@ -5,6 +5,10 @@ import numpy as np
 import random
 import os
 import sys
+import time
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # hide INFO + WARNING
 
 # training imports
 from stable_baselines3.common.env_util import make_atari_env
@@ -20,7 +24,7 @@ from skills.video_object_keypoints import Transporter
 from skills.video_object_segmentation import VideoObjectSegmentationModel
 
 from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
-from utils.custom_ppo import CustomPPO
+#from utils.custom_ppo import CustomPPO
 from utils.monitor_moe_weights import GatingMonitorCallback
 
 # IMPORTANT - REGISTER THE ENVIRONMENTS
@@ -38,7 +42,7 @@ load_dotenv()
 
 key = os.getenv("WANDB_API_KEY")
 if key is None:
-    raise ValueError("WANDB_API_KEY not set")
+    print("WANDB_API_KEY not set")
 
 
 def create_env(env_id, configs, seed=None):
@@ -84,7 +88,7 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     
     eval_envs = create_env(env_id=env_id, configs=configs, seed=None)
 
-    model = CustomPPO(  # Changed from PPO to CustomPPO
+    model = PPO(
         "CnnPolicy",
         vec_envs,
         learning_rate=linear_schedule(environment_configuration["learning_rate"]),
@@ -201,7 +205,7 @@ skills = [
 
 f_ext_kwargs = environment_configuration["f_ext_kwargs"]
 environment_configuration["f_ext_name"] = "moe_ext"
-environment_configuration["f_ext_class"] = SoftHardMOE
+environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
 
@@ -209,13 +213,18 @@ policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_cla
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
 
-
+start_time = time.time()
 train_agent(
     env, 
     environment_configuration, 
     policy_kwargs, 
     seed, 
     run_id="entropy_loss_expert_dropout_ema_smoothing", 
-    train_steps=1000000, 
+    train_steps=500000, 
     wandb=False
 )
+end_time = time.time()
+print(f"Training completed in {end_time - start_time} seconds.")
+# save training time to a file
+with open("training_time_sb3.txt", "w") as f:
+    f.write(f"Training time: {end_time - start_time} seconds\n")

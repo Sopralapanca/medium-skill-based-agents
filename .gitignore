@@ -14,3 +14,7 @@ resources/
 experiments/
 
 !.gitignore
+resources
+
+#ignore uv.lock file created by uv
+uv.lock

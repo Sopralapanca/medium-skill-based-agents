@@ -3,7 +3,7 @@ name = "skill-based-agents"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "ale-py>=0.11.2",
     "atariari",
@@ -28,6 +28,7 @@ dependencies = [
     "torch>=2.9.1",
     "torchvision>=0.24.1",
     "wandb>=0.23.1",
+    "pip>=25.3",
 ]
 
 [tool.uv.sources]

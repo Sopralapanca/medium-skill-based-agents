@@ -66,6 +66,11 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         self.__vobj_seg_adapter.to(device)
         self.__kpt_enc_adapter.to(device)
         self.__kpt_key_adapter.to(device)
+        
+        
+        self.__vobj_seg_adapter = torch.compile(self.__vobj_seg_adapter, mode="default")
+        self.__kpt_enc_adapter = torch.compile(self.__kpt_enc_adapter, mode="default")
+        self.__kpt_key_adapter = torch.compile(self.__kpt_key_adapter, mode="default")
 
         self.skills_embeddings = []
 

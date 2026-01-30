@@ -50,6 +50,11 @@ class AttentionFeatureExtractor(nn.Module):
         self.__kpt_enc_adapter.to(device)
         self.__kpt_key_adapter.to(device)
         
+        # Compile adapters for speed
+        self.__vobj_seg_adapter = torch.compile(self.__vobj_seg_adapter, mode="default")
+        self.__kpt_enc_adapter = torch.compile(self.__kpt_enc_adapter, mode="default")
+        self.__kpt_key_adapter = torch.compile(self.__kpt_key_adapter, mode="default")
+        
         # Initialize with dummy input to determine skill output sizes
         self._initialized = False
         

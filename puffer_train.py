@@ -4,6 +4,10 @@ import numpy as np
 import random
 import os
 from typing import List
+import time
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # hide INFO + WARNING
 
 # PufferLib imports
 import pufferlib
@@ -100,11 +104,16 @@ def train_with_pufferlib(
     # Create vectorized environment
     env_creator = make_env_creator(env_id)
     
+    # Choose backend based on number of environments
+    # Serial is faster for low env counts (< 4) due to less IPC overhead
+    num_envs = config.get("n_envs", 8)
+    backend = pufferlib.vector.Serial if os.cpu_count() <= 4 else pufferlib.vector.Multiprocessing
+    
     vecenv = pufferlib.vector.make(
         env_creator,
-        num_envs=config.get("n_envs", 8),
-        backend=pufferlib.vector.Multiprocessing,  # or Serial for debugging
-        overwork=True,  # Allow more workers than hardware cores
+        num_envs=num_envs,
+        backend=backend,
+        overwork=True if os.cpu_count() < num_envs and backend == pufferlib.vector.Multiprocessing else False,
     )
     
     # Create policy
@@ -128,8 +137,10 @@ def train_with_pufferlib(
     
     batch_size = config.get("batch_size", 256)
     
-    # Standard PPO default: 4 minibatches per epoch
-    minibatch_size = batch_size // 4 
+    # Minibatch size: larger = fewer gradient updates = faster training
+    # For speed optimization with small batch sizes, use full batch
+    # Set to batch_size for maximum speed, or batch_size // 4 for standard PPO
+    minibatch_size = batch_size  # Full batch for speed (fewer gradient updates) 
     
     class DictConfig:
         """Config class that supports both dict and attribute access"""
@@ -157,20 +168,20 @@ def train_with_pufferlib(
         
         # --- Network Architecture ---
         use_rnn=False,       # Set True only if using LSTM/GRU
-        compile=False,       # Set True for torch.compile speedup (optional)
+        compile=False,       # Disabled: compile may not work well with custom attention policy # if true causes issues
         compile_mode="reduce-overhead",
         
         # --- Data & Batching (The Missing Keys) ---
         batch_size=batch_size,
         minibatch_size=minibatch_size,
-        max_minibatch_size=minibatch_size, # Cap for GPU memory safety
+        max_minibatch_size=batch_size, # Cap for GPU memory safety
         bptt_horizon=16,     # Sequence length for RNNs (ignored if use_rnn=False but required)
         
         # --- Training Hyperparameters ---
         total_timesteps=config.get("total_timesteps", 1000000),
         learning_rate=config.get("learning_rate", 2.5e-4),
         num_steps=config.get("n_steps", 128),
-        num_envs=config.get("n_envs", 8),
+        num_envs=num_envs,  # Use the variable, not config again
         update_epochs=config.get("n_epochs", 4),
         
         # --- Optimizer ---
@@ -202,7 +213,7 @@ def train_with_pufferlib(
         
         # --- Precision & AMP ---
         precision='float32', # 'float32' or 'bfloat16'
-        amp=True,            # Automatic mixed precision
+        amp=False,            # Disable AMP for consistency with SB3 (can enable for speed)
         
         # --- Reproducibility ---
         seed=config.get("seed", 1),
@@ -210,12 +221,19 @@ def train_with_pufferlib(
         
         # --- Logging & Checkpointing ---
         data_dir="experiments",
-        checkpoint_interval=10000,
-        save_overlay=True,
-        verbose=1,
+        checkpoint_interval=1000000,  # Set high to avoid checkpointing in short runs
+        save_overlay=False,  # Disable overlay to reduce overhead
+        verbose=False,  # Disable verbose logging
     )
     
     # Create PuffeRL trainer
+    print(f"Creating PuffeRL trainer with:")
+    print(f"  - Backend: {backend.__name__}")
+    print(f"  - Num envs: {num_envs}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Minibatch size: {minibatch_size}")
+    print(f"  - Torch compile: {train_config.compile}")
+    
     trainer = pufferl.PuffeRL(
         config=train_config,
         vecenv=vecenv,
@@ -225,34 +243,25 @@ def train_with_pufferlib(
     # Training loop
     try:
         while trainer.global_step < train_config.total_timesteps:
-            # Collect experience
+            # Collect experience and train
+            # evaluate here is the rollout collection step 
             trainer.evaluate()
-            
-            # Train on collected data
             trainer.train()
             
-            # Print progress every epoch with reward stats
-            if trainer.epoch % 10 == 0:
-                # Get episode statistics
-                if 'episode_return' in trainer.stats:
-                    returns = trainer.stats['episode_return']
-                    if len(returns) > 0:
-                        mean_return = sum(returns) / len(returns)
-                        print(f"\nEpoch {trainer.epoch} - Mean Episode Return: {mean_return:.2f} "
-                              f"(from {len(returns)} episodes)")
-            
-            # Log metrics
+            # Only log to wandb if enabled (no other overhead)
             if use_wandb:
                 trainer.wandb_log()
-            
-            # Print dashboard less frequently
-            if trainer.global_step % 10000 == 0:
-                trainer.print_dashboard()
     
     except KeyboardInterrupt:
         print("Training interrupted by user")
     
     finally:
+        # Print final stats
+        if 'episode_return' in trainer.stats and len(trainer.stats['episode_return']) > 0:
+            returns = trainer.stats['episode_return']
+            mean_return = sum(returns) / len(returns)
+            print(f"Final stats - Epochs: {trainer.epoch}, Episodes: {len(returns)}, Mean Return: {mean_return:.2f}")
+        
         # Cleanup
         trainer.close()
         if use_wandb:
@@ -338,7 +347,7 @@ if __name__ == "__main__":
     config.update({
         "features_dim": 256,
         "hidden_size": 512,
-        "total_timesteps": 1000000,
+        "total_timesteps": 500000,
     })
     
     # Check for WandB key
@@ -350,6 +359,7 @@ if __name__ == "__main__":
     print(f"Device: {device}")
     print(f"WandB logging: {use_wandb}")
     
+    start_time = time.time()
     trainer = train_with_pufferlib(
         env_id=env_id,
         skills=skills,
@@ -357,5 +367,10 @@ if __name__ == "__main__":
         device=device,
         use_wandb=use_wandb,
     )
+    end_time = time.time()
+    print(f"Training completed in {end_time - start_time} seconds.")
     
-    print("Training complete!")
+    # save training time to a file
+    with open("training_time.txt", "w") as f:
+        f.write(f"Training time: {end_time - start_time} seconds\n")
+        
