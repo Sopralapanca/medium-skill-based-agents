@@ -15,6 +15,18 @@ import pufferlib.vector
 import pufferlib.emulation
 from pufferlib import pufferl
 
+import gymnasium as gym
+import ale_py
+from stable_baselines3.common.atari_wrappers import (
+    NoopResetEnv,
+    MaxAndSkipEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    ClipRewardEnv,
+)
+from gymnasium.wrappers import ResizeObservation, GrayscaleObservation, FrameStackObservation
+
+
 # Your existing skill imports
 from skills.autoencoder import Autoencoder
 from skills.unsupervised_state_representation import UnsupervisedStateRepresentationModel
@@ -37,16 +49,6 @@ def make_env_creator(env_id):
     """Create environment creator function for PufferLib"""
     def env_creator(buf=None, seed=None):
         # Import here to avoid issues with multiprocessing
-        import gymnasium as gym
-        import ale_py
-        from stable_baselines3.common.atari_wrappers import (
-            NoopResetEnv,
-            MaxAndSkipEnv,
-            EpisodicLifeEnv,
-            FireResetEnv,
-            ClipRewardEnv,
-        )
-        from gymnasium.wrappers import ResizeObservation, GrayscaleObservation, FrameStackObservation
         
         gym.register_envs(ale_py)
         
@@ -66,12 +68,14 @@ def make_env_creator(env_id):
         env = ResizeObservation(env, shape=(84, 84))
         env = FrameStackObservation(env, stack_size=4)
         
+        # Add PufferLib's episode stats wrapper BEFORE emulation wrapper
+        env = pufferlib.EpisodeStats(env)
+        
         # Wrap with PufferLib emulation for compatibility
-        # PufferLib handles vectorization, so this is a single env
         env = pufferlib.emulation.GymnasiumPufferEnv(
             env=env,
-            buf=buf,    # Shared memory buffer
-            seed=seed   # Environment seed
+            buf=buf,
+            seed=seed
         )
         
         return env
@@ -223,7 +227,7 @@ def train_with_pufferlib(
         data_dir="experiments",
         checkpoint_interval=1000000,  # Set high to avoid checkpointing in short runs
         save_overlay=False,  # Disable overlay to reduce overhead
-        verbose=False,  # Disable verbose logging
+        verbose=True,  # Enable verbose logging to see training progress
     )
     
     # Create PuffeRL trainer
