@@ -3,22 +3,26 @@ from stable_baselines3.common.callbacks import BaseCallback
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import wandb
 
-class GatingMonitorCallback(BaseCallback):
+class WeightMonitorCallback(BaseCallback):
     """
     Callback to monitor and save gating distribution during training
     """
-    def __init__(self, feature_extractor, env, run_id, save_freq=1000, save_path="./gating_weights", verbose=0):
+    def __init__(self, feature_extractor, env, run_id, save_freq=1000, verbose=0, use_wandb=False):
         super().__init__(verbose)
         self.feature_extractor = feature_extractor
         self.save_freq = save_freq
-        self.save_path = save_path
+        self.save_path = "./weights"
+        self.weights_file = os.path.join(self.save_path, f"{env}_{run_id}.pkl")
         self.timesteps = []
         self.all_weights = []
         self.env = env
         self.run_id = run_id
+        self.use_wandb = use_wandb
+
         
-        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(self.save_path, exist_ok=True)
         
     def save_weights(self):
         # Save the complete history
@@ -28,8 +32,7 @@ class GatingMonitorCallback(BaseCallback):
             'skill_names': [skill.name for skill in self.feature_extractor.skills]
         }
         
-        save_file = os.path.join(self.save_path, f"gating_weights_{self.env}_{self.run_id}.pkl")
-        with open(save_file, 'wb') as f:
+        with open(self.weights_file, 'wb') as f:
             pickle.dump(save_data, f)
         
     def _on_step(self) -> bool:
@@ -40,6 +43,10 @@ class GatingMonitorCallback(BaseCallback):
                 weights = self.feature_extractor.training_weights.copy()
                 self.all_weights.append(weights)
                 self.timesteps.append(self.num_timesteps)
+                
+                # Log to wandb if enabled
+                if self.use_wandb:
+                    self._log_to_wandb(weights)
                 
                 # Clear the buffer to avoid memory issues
                 self.feature_extractor.training_weights = []
@@ -52,6 +59,46 @@ class GatingMonitorCallback(BaseCallback):
         
         return True
     
+    def _log_to_wandb(self, weights):
+        """Log weight statistics to wandb"""
+        # Weights are now pre-averaged over batch: each entry is [num_experts]
+        all_weights_list = []
+        for w in weights:
+            if len(w.shape) == 1:  # 1D: [num_experts]
+                all_weights_list.append(w.cpu().numpy())
+            elif len(w.shape) == 2:  # 2D: [batch, num_experts] (legacy support)
+                all_weights_list.append(w.cpu().numpy())
+        
+        if not all_weights_list:
+            return
+        
+        # Stack to get [num_timesteps, num_experts] and average over time
+        all_weights_stacked = np.stack(all_weights_list, axis=0)
+        
+        # Calculate mean weight per expert across all timesteps in this checkpoint
+        mean_weights = np.mean(all_weights_stacked, axis=0)  # [num_experts]
+        
+        # Get skill names
+        skill_names = [skill.name for skill in self.feature_extractor.skills]
+        
+        # Log individual expert weights
+        log_dict = {}
+        for i, name in enumerate(skill_names):
+            log_dict[f"attention_weights/{name}"] = mean_weights[i]
+        
+        # Calculate and log entropy (measure of diversity)
+        weights_safe = mean_weights + 1e-10
+        weights_safe = weights_safe / weights_safe.sum()
+        entropy = -np.sum(weights_safe * np.log(weights_safe))
+        log_dict["attention_weights/entropy"] = entropy
+        log_dict["attention_weights/max_weight"] = np.max(mean_weights)
+        
+        # Log the dominant expert
+        dominant_idx = np.argmax(mean_weights)
+        log_dict["attention_weights/dominant_expert_idx"] = dominant_idx
+        
+        wandb.log(log_dict, step=self.num_timesteps)
+    
     def _on_training_end(self) -> None:
         """Save all collected weights at the end of training"""
         # Save any remaining weights
@@ -59,6 +106,10 @@ class GatingMonitorCallback(BaseCallback):
             weights = self.feature_extractor.training_weights.copy()
             self.all_weights.append(weights)
             self.timesteps.append(self.num_timesteps)
+            
+            # Log final weights to wandb
+            if self.use_wandb:
+                self._log_to_wandb(weights)
         
         self.save_weights()
     
@@ -90,24 +141,30 @@ def plot_gating_distribution(weights_file, output_dir="./gating_plots"):
     # Concatenate all weight arrays
     all_weights_concat = []
     for checkpoint_weights in weights:
-        # checkpoint_weights is a list of numpy arrays with varying batch sizes
+        # checkpoint_weights is a list of tensors
         for w in checkpoint_weights:
-            # w has shape (batch_size, num_experts)
-            # Average over batch dimension to get per-step values
-            if len(w.shape) == 2:
-                all_weights_concat.append(w)  # Keep individual samples
+            # w can be either [num_experts] (new format) or [batch, num_experts] (legacy)
+            if hasattr(w, 'cpu'):
+                w_np = w.cpu().numpy()
             else:
-                print(f"Warning: Unexpected weight shape {w.shape}, skipping")
+                w_np = w
+            
+            if len(w_np.shape) == 1:  # [num_experts] - new format (already averaged)
+                all_weights_concat.append(w_np[np.newaxis, :])  # Add batch dim: [1, num_experts]
+            elif len(w_np.shape) == 2:  # [batch, num_experts] - legacy format
+                all_weights_concat.append(w_np)
+            else:
+                print(f"Warning: Unexpected weight shape {w_np.shape}, skipping")
     
     if not all_weights_concat:
         print("Error: No valid weights found!")
         return None
     
-    all_weights_concat = np.concatenate([w.cpu().numpy() for w in all_weights_concat], axis=0)  # (total_steps, num_experts)
+    all_weights_concat = np.concatenate(all_weights_concat, axis=0)  # (total_steps, num_experts)
     
     # Calculate statistics
     print(f"\nTotal steps recorded: {all_weights_concat.shape[0]}")
-    print(f"\nMean weights per expert:")
+    print("\nMean weights per expert:")
     for i, name in enumerate(skill_names):
         print(f"  {name}: {np.mean(all_weights_concat[:, i]):.4f}")
     

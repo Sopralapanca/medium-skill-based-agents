@@ -21,7 +21,7 @@ from skills.video_object_segmentation import VideoObjectSegmentationModel
 
 from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
 from utils.custom_ppo import CustomPPO
-from utils.monitor_weights import GatingMonitorCallback
+from utils.monitor_weights import WeightMonitorCallback, plot_gating_distribution
 
 # IMPORTANT - REGISTER THE ENVIRONMENTS
 import gymnasium as gym
@@ -69,22 +69,21 @@ def init_wandb(environment_configuration):
   return run
 
 
-def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=5000, wandb=False):
+def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=5000, wandb=False, weight_monitor=False):
     if wandb:
         run = init_wandb(configs)
-        monitor_dir = str(run.id)
+        #run_id = str(run.id)
     else:
         run = None
-        monitor_dir = "ppo"
     
     logdir = "./tensorboard_logs"
             
     vec_envs = create_env(env_id=env_id, configs=configs, seed=seed)
     _ = vec_envs.reset()
     
-    eval_envs = create_env(env_id=env_id, configs=configs, seed=None)
+    #eval_envs = create_env(env_id=env_id, configs=configs, seed=None)
 
-    model = CustomPPO(  # Changed from PPO to CustomPPO
+    model = CustomPPO(
         "CnnPolicy",
         vec_envs,
         learning_rate=linear_schedule(environment_configuration["learning_rate"]),
@@ -102,13 +101,13 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     )
 
 
-    eval_logs = f"eval_logs/{env}/{monitor_dir}"
+    eval_logs = f"eval_logs/{env}/{run_id}"
     os.makedirs(eval_logs, exist_ok=True)
 
     # eval_callback = EvalCallback(
     #     eval_envs,
     #     n_eval_episodes=100,
-    #     best_model_save_path=f"./agents/{monitor_dir}",
+    #     best_model_save_path=f"./agents/{run_id}",
     #     log_path=eval_logs,
     #     eval_freq=5000 * environment_configuration["n_envs"],
     #     verbose=0,
@@ -121,29 +120,40 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     if wandb:
         callbacks.append(WandbCallback(verbose=0))
 
-    if configs["f_ext_name"] == "moe_ext" or configs["f_ext_name"] == "wsharing_attention_ext":
+    if weight_monitor:
         # Get the feature extractor from the model
         feature_extractor = model.policy.features_extractor
 
         # Create monitoring callback
-        gating_monitor = GatingMonitorCallback(
+        weight_monitor = WeightMonitorCallback(
             feature_extractor=feature_extractor,
             env=env_id,
-            save_freq=500,  # Save every 500 steps
             run_id=run_id,
-            save_path="./gating_weights",
-            verbose=0
+            save_freq=1000,  # Save every 1000 steps
+            verbose=0,
+            use_wandb=True  # Enable wandb logging if wandb is enabled
         )
         
-        callbacks.append(gating_monitor)
+        callbacks.append(weight_monitor)
     try:    
-        model.learn(train_steps, callback=callbacks, progress_bar=True) #tb_log_name=run.id)
+        model.learn(train_steps, callback=callbacks, progress_bar=True)
     except KeyboardInterrupt:
-        gating_monitor._on_training_end()
+        weight_monitor._on_training_end()
         sys.exit(0)
     
     if run is not None:
         run.finish()
+        
+    # #Plot the results
+    # if weight_monitor:
+    #     weights_file = weight_monitor.weights_file
+    #     if os.path.exists(weights_file):
+    #         plot_gating_distribution(weights_file, output_dir=weight_monitor.save_path)
+    #     else:
+    #         raise FileNotFoundError(f"Warning: Weights file not found at {weights_file}")
+
+
+        
 
 # Load config
 _config_path = "./configs.yaml"
@@ -201,7 +211,7 @@ skills = [
 
 f_ext_kwargs = environment_configuration["f_ext_kwargs"]
 environment_configuration["f_ext_name"] = "moe_ext"
-environment_configuration["f_ext_class"] = SoftHardMOE
+environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
 
@@ -209,13 +219,19 @@ policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_cla
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
 
-
+start_time = time.time()
 train_agent(
     env, 
     environment_configuration, 
     policy_kwargs, 
     seed, 
-    run_id="entropy_loss_expert_dropout_ema_smoothing", 
-    train_steps=10000000, 
-    wandb=True
-    )
+    run_id="load_balancing_loss_2", 
+    train_steps=500000, 
+    wandb=True,
+    weight_monitor=True
+)
+end_time = time.time()
+print(f"Training completed in {end_time - start_time} seconds.")
+# save training time to a file
+with open("training_time_sb3.txt", "w") as f:
+    f.write(f"Training time: {end_time - start_time} seconds\n")

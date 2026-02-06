@@ -178,7 +178,7 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
             nn.Linear((2 * features_dim), 1, device=device), nn.ReLU()
         )
 
-        # self.dropout = nn.Dropout(p=dropout_p)
+        #self.dropout = nn.Dropout(p=0.1)
 
         # ---------- saving info ---------- #
 
@@ -186,6 +186,10 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         self.spatial_adapters = []
         self.linear_adapters = []
         self.training_weights = []
+        
+        # Track number of experts (skills) for auxiliary loss
+        self.num_experts = len(self.skills)
+        self.routing_entropy = None
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # print("forward observation shape", observations.shape)
@@ -214,9 +218,18 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         weights = torch.stack(weights, 1)
         weights = torch.softmax(weights, 1) # weights shape torch.Size([8, 4, 1])
         
+        # Compute routing entropy for auxiliary loss
+        # Squeeze for entropy calculation: [batch, num_experts]
+        weights_2d = weights.squeeze(-1)
+        entropy_per_sample = -torch.sum(weights_2d * torch.log(weights_2d + 1e-10), dim=1)
+        self.routing_entropy = entropy_per_sample.mean()
+        
         # Store on GPU - only transfer when needed for logging
-        # Squeeze last dimension to match monitoring format: [batch, num_experts]
-        self.training_weights.append(weights.squeeze(-1).detach())
+        # Average over batch to handle variable batch sizes (rollout vs training)
+        self.training_weights.append(weights_2d.mean(dim=0).detach())  # [num_experts]
+        # if len(self.training_weights) > 128:
+        #     self.training_weights = self.training_weights[-128:]
+        
         # weights = self.dropout(weights)
 
         # save attention weights to plot them in evaluation
@@ -230,6 +243,57 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         att_out = weights * stacked_skills
         att_out = torch.sum(att_out, 1)
         return att_out
+    
+    def get_auxiliary_loss(self) -> torch.Tensor:
+        """Auxiliary loss to prevent weight collapse and encourage skill diversity.
+        
+        Encourages:
+        1. Temporal/spatial diversity: different frames use different skill combinations
+        2. Load balancing: all skills get utilized over time across environments
+        
+        Allows: per-frame specialization (weights can focus on relevant skills per frame)
+        """
+        
+        if not hasattr(self, 'training_weights') or len(self.training_weights) == 0:
+            return torch.tensor(0.0, device=self.device)
+        
+        if self.routing_entropy is None:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Stack recent weights: [num_timesteps, num_experts]
+        # Each entry is already averaged over batch dimension
+        # Only use last 512 timesteps to prevent memory issues while keeping full history for plotting
+        recent_weights = torch.stack(self.training_weights[-512:])  # [T, E]
+        
+        # 1. Load Balancing Loss
+        # Ensure each skill is used roughly equally over time
+        # Average weight per skill across all timesteps
+        avg_skill_usage = recent_weights.mean(dim=0)  # [num_experts]
+        
+        # Target: uniform usage (1/num_experts)
+        uniform_target = 1.0 / self.num_experts
+        
+        # Penalize deviation from uniform target (MSE loss)
+        # High when some experts are over/under-utilized
+        load_balance_loss = torch.mean((avg_skill_usage - uniform_target) ** 2)
+        
+        # 2. Entropy Regularization
+        # Penalize low entropy (collapsed distributions)
+        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
+        
+        # Normalize entropy to [0, 1] where 1 = uniform, 0 = collapsed
+        normalized_entropy = self.routing_entropy / (max_entropy + 1e-10)
+        
+        # Loss increases as entropy decreases (collapsed)
+        entropy_penalty = 1.0 - normalized_entropy
+        
+        # Combine losses with tunable coefficients
+        entropy_coef = 0.0001  # Weight for entropy regularization
+        load_balance_coef = 0.000015  # Weight for load balancing
+        
+        total_loss = (entropy_coef * entropy_penalty) + (load_balance_coef * load_balance_loss)
+        #total_loss = load_balance_coef * load_balance_loss
+        return total_loss
 
 
     

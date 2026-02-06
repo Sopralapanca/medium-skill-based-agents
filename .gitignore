@@ -8,6 +8,8 @@ data/
 data_pt/
 build/
 wandb/
+weights/
+
 *.egg-info/
 
 
