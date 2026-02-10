@@ -35,7 +35,7 @@ dependencies = [
 atariari = { git = "https://github.com/Sopralapanca/atari-representation-learning.git" }
 torch = { index = "pytorch-cu126" }
 torchvision = { index = "pytorch-cu126" }
-pufferlib = {git = "https://github.com/PufferAI/PufferLib.git" }
+pufferlib = {git = "https://github.com/PufferAI/PufferLib.git", rev = "65e88c8"}
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

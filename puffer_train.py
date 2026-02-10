@@ -139,12 +139,15 @@ def train_with_pufferlib(
             tags=["attention", "skills", env_id],
         )
     
-    batch_size = config.get("batch_size", 256)
+    # Calculate batch size based on rollout: num_envs * num_steps
+    # This matches the total number of samples collected per rollout
+    batch_size = num_envs * config.get("n_steps", 128)  # e.g., 8 * 128 = 1024
     
-    # Minibatch size: larger = fewer gradient updates = faster training
-    # For speed optimization with small batch sizes, use full batch
-    # Set to batch_size for maximum speed, or batch_size // 4 for standard PPO
-    minibatch_size = batch_size  # Full batch for speed (fewer gradient updates) 
+    # Minibatch size: determines how many gradient updates per epoch
+    # Smaller = more updates = better learning but slower
+    # For standard PPO: use batch_size // 4 to get 4 minibatches per epoch
+    # With 4 epochs, this gives 16 gradient updates total (matching SB3)
+    minibatch_size = batch_size // 4 #config.get("batch_size", 256)  # Use config batch_size as minibatch_size
     
     class DictConfig:
         """Config class that supports both dict and attribute access"""

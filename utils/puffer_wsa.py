@@ -104,6 +104,10 @@ class AttentionFeatureExtractor(nn.Module):
             nn.ReLU()
         )
         
+        # Storage for attention weights (for monitoring)
+        self.att_weights = {}
+        self.training_weights = []
+        
         self._initialized = True
     
     def _preprocess_input(self, observations: torch.Tensor) -> List[torch.Tensor]:
@@ -132,11 +136,15 @@ class AttentionFeatureExtractor(nn.Module):
         Forward pass combining skill embeddings with attention.
         
         Args:
-            observations: Shape (batch, channels, height, width)
+            observations: Shape (batch, channels, height, width) or (batch, 1, channels, height, width)
             
         Returns:
             Combined feature vector of shape (batch, features_dim)
         """
+        
+        # Handle PufferLib's extra dimension: (batch, 1, 4, 84, 84) -> (batch, 4, 84, 84)
+        if observations.ndim == 5 and observations.shape[1] == 1:
+            observations = observations.squeeze(1)
         
         # Convert uint8 to float32 and normalize to [0, 1]
         if observations.dtype == torch.uint8:
@@ -169,6 +177,13 @@ class AttentionFeatureExtractor(nn.Module):
         # Compute attention
         weights = torch.stack(weights, 1)
         weights = torch.softmax(weights, 1)
+        
+        # Store attention weights for monitoring (matching SB3 implementation)
+        self.training_weights.append(weights.squeeze(-1).detach())
+        
+        # Save attention weights per skill
+        for i, skill in enumerate(self.skills):
+            self.att_weights[skill.name] = [w[i] for w in weights]
         
         # Stack skills and apply attention
         stacked_skills = torch.stack(skills_embeddings, 0).permute(1, 0, 2)
@@ -229,21 +244,22 @@ class AttentionPolicy(nn.Module):
             state: Optional dict with LSTM state (for RNN policies, ignored here)
             
         Returns:
-            Tuple of (logits, value)
+            Tuple of (logits, value) - PufferLib expects only 2 values
         """
-        # Extract features
+        # Extract features (handles PufferLib's extra dimension internally)
         features = self.feature_extractor(observations)
         
         # Get policy logits and value
         logits = self.actor(features)
-        value = self.critic(features)
+        value = self.critic(features).squeeze(-1)
         
+        # Return only (logits, value) - state is not returned for non-recurrent policies
         return logits, value
     
     def get_value(self, observations):
         """Get value estimate for observations"""
         features = self.feature_extractor(observations)
-        return self.critic(features)
+        return self.critic(features).squeeze(-1)
     
     def get_action_and_value(self, observations, action=None):
         """
@@ -253,7 +269,7 @@ class AttentionPolicy(nn.Module):
         features = self.feature_extractor(observations)
         
         logits = self.actor(features)
-        value = self.critic(features)
+        value = self.critic(features).squeeze(-1)
         
         # Sample action if not provided
         probs = torch.distributions.Categorical(logits=logits)
@@ -271,8 +287,16 @@ class AttentionPolicy(nn.Module):
             state: RNN state (not used for non-recurrent policies)
             
         Returns:
-            Tuple of (logits, value)
+            Tuple of (logits, value) - note: does NOT return state for eval
         """
-        return self.forward(observations)
+        # Extract features
+        features = self.feature_extractor(observations)
+        
+        # Get policy logits and value
+        logits = self.actor(features)
+        value = self.critic(features).squeeze(-1)
+        
+        # Return only (logits, value) for evaluation - PufferLib expects 2 values
+        return logits, value
 
 
