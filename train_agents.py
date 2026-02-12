@@ -5,6 +5,11 @@ import numpy as np
 import random
 import os
 import sys
+import argparse
+
+# Set seeds for reproducibility
+os.environ['PYTHONHASHSEED'] = str(42)
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # For deterministic CUDA operations
 
 # training imports
 from stable_baselines3.common.env_util import make_atari_env
@@ -35,10 +40,24 @@ gym.register_envs(ale_py)
 
 load_dotenv()
 
+# Parse command line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train RL agents with skill-based feature extractors')
+    parser.add_argument('--entropy_coef', type=float, default=0.0001,
+                        help='Entropy coefficient for auxiliary loss (default: 0.0001)')
+    parser.add_argument('--load_balance_coef', type=float, default=0.000015,
+                        help='Load balance coefficient for auxiliary loss (default: 0.000015)')
+    parser.add_argument('--run_id', type=str,
+                        help='Run ID for logging and saving models (default: load_balancing_loss_2)')
+    return parser.parse_args()
+
 
 key = os.getenv("WANDB_API_KEY")
 if key is None:
     raise ValueError("WANDB_API_KEY not set")
+
+# Parse command line arguments
+args = parse_args()
 
 
 def create_env(env_id, configs, seed=None):
@@ -48,7 +67,7 @@ def create_env(env_id, configs, seed=None):
     return env
 
 
-def init_wandb(environment_configuration):
+def init_wandb(environment_configuration, run_id=None):
   wandb.login(key=key)
 
   tags = [
@@ -58,6 +77,7 @@ def init_wandb(environment_configuration):
 
   run = wandb.init(
       project="medium-skill-based-agents",
+      name=run_id,  # Set custom run name
       config=environment_configuration,
       sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
       monitor_gym=False,  # auto-upload the videos of agents playing the game
@@ -71,7 +91,7 @@ def init_wandb(environment_configuration):
 
 def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=5000, wandb=False, weight_monitor=False):
     if wandb:
-        run = init_wandb(configs)
+        run = init_wandb(configs, run_id=run_id)
         #run_id = str(run.id)
     else:
         run = None
@@ -166,11 +186,22 @@ with open(_config_path, "r") as f:
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # ignore tensorflow warnings about CPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-seed = None
-if seed is not None:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+# Set seed for reproducibility
+seed = 42
+
+# Set seeds for all libraries
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)  # For multi-GPU
+
+# Enable deterministic operations (may impact performance)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# For PyTorch >= 1.8
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 #envs = _config.get("ENVS", ["PongNoFrameskip-v4"])[0]
@@ -214,24 +245,20 @@ environment_configuration["f_ext_name"] = "moe_ext"
 environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
 f_ext_kwargs["skills"] = skills
 f_ext_kwargs["features_dim"] = 256
+f_ext_kwargs["entropy_coef"] = args.entropy_coef
+f_ext_kwargs["load_balance_coef"] = args.load_balance_coef
 
 policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
 policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
 
 
-start_time = time.time()
 train_agent(
     env, 
     environment_configuration, 
     policy_kwargs, 
     seed, 
-    run_id="load_balancing_loss_2", 
+    run_id=args.run_id, 
     train_steps=500000, 
     wandb=True,
     weight_monitor=True
 )
-end_time = time.time()
-print(f"Training completed in {end_time - start_time} seconds.")
-# save training time to a file
-with open("training_time_sb3.txt", "w") as f:
-    f.write(f"Training time: {end_time - start_time} seconds\n")

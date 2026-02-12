@@ -119,12 +119,16 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         features_dim: int = 256,
         skills: List[Skill] | None = None,
         device="cpu",
+        entropy_coef: float = 0.0001,
+        load_balance_coef: float = 0.000015,
     ):
         """
         :param observation_space: Gymnasium observation space
         :param features_dim: Number of features extracted from the observations. This corresponds to the number of units for the last layer.
         :param skills: List of skill objects.
         :param device: Device used for computation.
+        :param entropy_coef: Coefficient for entropy regularization in auxiliary loss.
+        :param load_balance_coef: Coefficient for load balancing in auxiliary loss.
         """
         super().__init__(observation_space, features_dim, skills, device)
 
@@ -177,6 +181,12 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         self.weights = nn.Sequential(
             nn.Linear((2 * features_dim), 1, device=device), nn.ReLU()
         )
+        
+        # Initialize weights to produce uniform distribution across skills
+        # Small weights and zero bias -> near-zero logits -> uniform softmax
+        with torch.no_grad():
+            self.weights[0].weight.data *= 0.01  # Small random weights
+            self.weights[0].bias.data.zero_()     # Zero bias
 
         #self.dropout = nn.Dropout(p=0.1)
 
@@ -190,6 +200,10 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         # Track number of experts (skills) for auxiliary loss
         self.num_experts = len(self.skills)
         self.routing_entropy = None
+        
+        # Store coefficients for auxiliary loss
+        self.entropy_coef = entropy_coef
+        self.load_balance_coef = load_balance_coef
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # print("forward observation shape", observations.shape)
@@ -287,12 +301,9 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         # Loss increases as entropy decreases (collapsed)
         entropy_penalty = 1.0 - normalized_entropy
         
-        # Combine losses with tunable coefficients
-        entropy_coef = 0.0001  # Weight for entropy regularization
-        load_balance_coef = 0.000015  # Weight for load balancing
-        
-        total_loss = (entropy_coef * entropy_penalty) + (load_balance_coef * load_balance_loss)
-        #total_loss = load_balance_coef * load_balance_loss
+        # Combine losses with tunable coefficients (from initialization)
+        total_loss = (self.entropy_coef * entropy_penalty) + (self.load_balance_coef * load_balance_loss)
+        #total_loss = self.load_balance_coef * load_balance_loss
         return total_loss
 
 
