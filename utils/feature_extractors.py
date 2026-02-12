@@ -65,7 +65,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         self.__kpt_enc_adapter.to(device)
         self.__kpt_key_adapter.to(device)
 
-        self.skills_embeddings = []
+        self.skills_embeddings: List[torch.Tensor] = []
 
         # self.num_channels = 0
         # for el in self.skills_embeddings:
@@ -73,7 +73,9 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         #         self.num_channels += el.shape[1]
 
     def preprocess_input(
-        self, observations: torch.Tensor, skill_indices: List[int] = None
+        self, 
+        observations: torch.Tensor, 
+        skill_indices: List[int] | None = None
     ):
         """
         :param observations: torch tensor of shape (n_envs, n_stacked_frames, height, width)
@@ -137,23 +139,20 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         sample = torch.from_numpy(sample) / 255
         sample = sample.to(device)
 
-        # dropout_p = 0.1
-
         self.preprocess_input(sample)  # this will populate self.skills_embeddings
 
         # linear layers to learn a representation of the skills
         self.mlp_layers = nn.ModuleList()
         for i in range(len(self.skills_embeddings)):
             seq_layer = nn.Sequential(
+                nn.LayerNorm(self.skills_embeddings[i].shape[1], device=device),
                 nn.Linear(
                     self.skills_embeddings[i].shape[1], features_dim, device=device
                 ),
-                nn.ReLU(),
-                # nn.Sigmoid(),
-                # nn.Dropout(p=dropout_p)
-                # nn.BatchNorm1d(features_dim, device=device),
+                nn.ReLU(),                
             )
             self.mlp_layers.append(seq_layer)
+        
 
         # linear layer for context in the attention
         model_path = "skills/torch_models/nature-encoder-all-envs.pt"
@@ -168,33 +167,21 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         self.input_size = z.shape[-1]
 
         self.encoder_lin_layer = nn.Sequential(
+            nn.LayerNorm(self.input_size, device=device),
             nn.Linear(self.input_size, features_dim, device=device),
             nn.ReLU(),
-            # nn.Sigmoid(),
-            # nn.Dropout(p=dropout_p)
-            # nn.BatchNorm1d(features_dim, device=device),
         )
-
-        # linear layers for attention weights
-        # Note: No activation function here - logits can be negative
         self.weights = nn.Linear((2 * features_dim), 1, device=device)
         
-        # Initialize weights to produce uniform distribution across skills
-        # Zero initialization gives uniform softmax (~1/num_experts for each skill)
-        with torch.no_grad():
-            # Initialize with very small weights for stable gradients
-            nn.init.xavier_uniform_(self.weights.weight, gain=0.01)
-            # Zero bias means all logits start at ~0, giving uniform softmax
-            nn.init.constant_(self.weights.bias, 0.0)
-
-        #self.dropout = nn.Dropout(p=0.1)
+        self.final_layer_norm = nn.LayerNorm(features_dim, device=device)
 
         # ---------- saving info ---------- #
 
         self.att_weights = {}
         self.spatial_adapters = []
         self.linear_adapters = []
-        self.training_weights = []
+        self.training_weights = []  # For monitoring only (detached)
+        self.current_batch_weights = None  # For auxiliary loss gradients (not detached)
         
         # Track number of experts (skills) for auxiliary loss
         self.num_experts = len(self.skills)
@@ -217,11 +204,11 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
 
         for i in range(len(self.skills_embeddings)):
             seq_layer = self.mlp_layers[i]
-
+        
             self.skills_embeddings[i] = seq_layer(
                 self.skills_embeddings[i]
             )  # pass through a mlp layer to reduce and fix the dimension
-
+            
             concatenated = torch.cat([encoded_frame, self.skills_embeddings[i]], 1)
 
             weight: torch.Tensor = self.weights(concatenated)
@@ -230,11 +217,12 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         weights = torch.stack(weights, 1)
         weights = torch.softmax(weights, 1) # weights shape torch.Size([8, 4, 1])
         
-        # Store weights for load balancing loss
-        # Average over batch to handle variable batch sizes (rollout vs training)
+        # Store weights for load balancing loss (NOT detached for gradients)
         weights_2d = weights.squeeze(-1)  # [batch, num_experts]
-        self.training_weights.append(weights_2d.mean(dim=0).detach())  # [num_experts]
-        # Keep only recent history to prevent memory issues
+        self.current_batch_weights = weights_2d  # Keep gradients for auxiliary loss
+        
+        # Store detached version for monitoring/logging only
+        self.training_weights.append(weights_2d.mean(dim=0).detach())
         # if len(self.training_weights) > 1024:
         #     self.training_weights = self.training_weights[-1024:]
         
@@ -250,43 +238,41 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         # sum product of weights and skills
         att_out = weights * stacked_skills
         att_out = torch.sum(att_out, 1)
-        return att_out
+        final_out = self.final_layer_norm(att_out)
+        return final_out
     
-    def get_auxiliary_loss(self) -> torch.Tensor:
-        """Auxiliary loss to encourage skill diversity over time.
+    # def get_auxiliary_loss(self) -> torch.Tensor:
+    #     """Auxiliary loss to encourage skill diversity over long time horizons.
         
-        Uses ONLY load balancing loss to ensure all skills are utilized over time,
-        while allowing per-timestep specialization (e.g., [90%, 5%, 5%] at one timestep,
-        [10%, 50%, 40%] at another timestep).
+    #     Uses a two-component approach:
+    #     1. Long-term load balancing: Tracks skill usage via EMA across many batches,
+    #        encouraging uniform usage over episodes/training (allows per-timestep specialization)
+    #     2. Current batch guidance: Gently nudges current batch toward the long-term target
+    #        to prevent sudden collapse while allowing dynamic, context-dependent routing
         
-        This approach:
-        - Allows: Per-timestep specialization (agent can focus on specific skills when needed)
-        - Encourages: All skills get used roughly equally OVER TIME across episodes
-        - Prevents: Complete collapse where one skill is always used
-        """
+    #     This enables:
+    #     - Per-timestep specialization: t=[0.10, 0.60, 0.05, 0.25], t+1=[0.70, 0.10, 0.10, 0.10]
+    #     - Per-batch adaptation: Batch can be biased toward relevant skills for current game states
+    #     - Long-term balance: Over thousands of steps, all skills used roughly equally
+    #     """
         
-        if not hasattr(self, 'training_weights') or len(self.training_weights) == 0:
-            return torch.tensor(0.0, device=self.device)
+    #     if self.current_batch_weights is None:
+    #         return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        # Stack recent weights: [num_timesteps, num_experts]
-        # Each entry is already averaged over batch dimension
-        # Use last 1024 timesteps for stability
-        recent_weights = torch.stack(self.training_weights[-1024:])  # [T, E]
+    #     # Shape: [batch_size, num_experts]
+    #     batch_weights = self.current_batch_weights
         
-        # Load Balancing Loss
-        # Ensure each skill is used roughly equally over time (not per timestep)
-        # Average weight per skill across all recent timesteps
-        avg_skill_usage = recent_weights.mean(dim=0)  # [num_experts]
+    #     # Average usage in current batch (with gradients)
+    #     avg_batch_usage = batch_weights.mean(dim=0)  # [num_experts]
         
-        # Target: uniform usage over time (1/num_experts)
-        uniform_target = 1.0 / self.num_experts
+    #     # Target: uniform distribution (1/num_experts for each expert)
+    #     uniform_target = 1.0 / self.num_experts
         
-        # Penalize deviation from uniform target (MSE loss)
-        # High when some experts are over/under-utilized OVER TIME
-        load_balance_loss = torch.mean((avg_skill_usage - uniform_target) ** 2)
+
+    #     # Gradient flows through avg_batch_usage -> current_batch_weights
+    #     load_balance_loss = torch.mean((avg_batch_usage - uniform_target) ** 2)
         
-        # Return only load balance loss (scaled by coefficient)
-        return self.load_balance_coef * load_balance_loss
+    #     return self.load_balance_coef * load_balance_loss
 
 
     
