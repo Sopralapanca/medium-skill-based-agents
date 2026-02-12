@@ -176,18 +176,16 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         )
 
         # linear layers for attention weights
-        self.weights = nn.Sequential(
-            nn.Linear((2 * features_dim), 1, device=device), nn.ReLU()
-        )
+        # Note: No activation function here - logits can be negative
+        self.weights = nn.Linear((2 * features_dim), 1, device=device)
         
         # Initialize weights to produce uniform distribution across skills
-        # Initialize with very small values so all skills start with approximately equal logits
-        # This gives uniform softmax (~1/num_experts for each skill) at initialization
+        # Zero initialization gives uniform softmax (~1/num_experts for each skill)
         with torch.no_grad():
-            # Use small xavier-like initialization scaled down further
-            nn.init.xavier_uniform_(self.weights[0].weight, gain=0.01)
-            # Initialize bias to small negative value to prevent saturation
-            nn.init.constant_(self.weights[0].bias, -0.1)
+            # Initialize with very small weights for stable gradients
+            nn.init.xavier_uniform_(self.weights.weight, gain=0.01)
+            # Zero bias means all logits start at ~0, giving uniform softmax
+            nn.init.constant_(self.weights.bias, 0.0)
 
         #self.dropout = nn.Dropout(p=0.1)
 
