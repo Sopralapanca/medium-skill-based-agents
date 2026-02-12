@@ -7,8 +7,6 @@ from skills.autoencoder import Autoencoder
 import torch.nn.functional as F
 from skills.skill_interface import Skill
 import numpy as np
-import math
-
 
 def get_embedding_for_context(
         observations: torch.Tensor,
@@ -28,7 +26,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         self,
         observation_space: spaces.Box,
         features_dim: int = 256,
-        skills: List[Skill] = None,
+        skills: List[Skill] | None = None,
         device="cpu",
     ):
         super().__init__(observation_space, features_dim)
@@ -183,10 +181,13 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         )
         
         # Initialize weights to produce uniform distribution across skills
-        # Small weights and zero bias -> near-zero logits -> uniform softmax
+        # Initialize with very small values so all skills start with approximately equal logits
+        # This gives uniform softmax (~1/num_experts for each skill) at initialization
         with torch.no_grad():
-            self.weights[0].weight.data *= 0.01  # Small random weights
-            self.weights[0].bias.data.zero_()     # Zero bias
+            # Use small xavier-like initialization scaled down further
+            nn.init.xavier_uniform_(self.weights[0].weight, gain=0.01)
+            # Initialize bias to small negative value to prevent saturation
+            nn.init.constant_(self.weights[0].bias, -0.1)
 
         #self.dropout = nn.Dropout(p=0.1)
 
@@ -199,7 +200,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         
         # Track number of experts (skills) for auxiliary loss
         self.num_experts = len(self.skills)
-        self.routing_entropy = None
         
         # Store coefficients for auxiliary loss
         self.entropy_coef = entropy_coef
@@ -232,17 +232,13 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         weights = torch.stack(weights, 1)
         weights = torch.softmax(weights, 1) # weights shape torch.Size([8, 4, 1])
         
-        # Compute routing entropy for auxiliary loss
-        # Squeeze for entropy calculation: [batch, num_experts]
-        weights_2d = weights.squeeze(-1)
-        entropy_per_sample = -torch.sum(weights_2d * torch.log(weights_2d + 1e-10), dim=1)
-        self.routing_entropy = entropy_per_sample.mean()
-        
-        # Store on GPU - only transfer when needed for logging
+        # Store weights for load balancing loss
         # Average over batch to handle variable batch sizes (rollout vs training)
+        weights_2d = weights.squeeze(-1)  # [batch, num_experts]
         self.training_weights.append(weights_2d.mean(dim=0).detach())  # [num_experts]
-        # if len(self.training_weights) > 128:
-        #     self.training_weights = self.training_weights[-128:]
+        # Keep only recent history to prevent memory issues
+        # if len(self.training_weights) > 1024:
+        #     self.training_weights = self.training_weights[-1024:]
         
         # weights = self.dropout(weights)
 
@@ -259,52 +255,40 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         return att_out
     
     def get_auxiliary_loss(self) -> torch.Tensor:
-        """Auxiliary loss to prevent weight collapse and encourage skill diversity.
+        """Auxiliary loss to encourage skill diversity over time.
         
-        Encourages:
-        1. Temporal/spatial diversity: different frames use different skill combinations
-        2. Load balancing: all skills get utilized over time across environments
+        Uses ONLY load balancing loss to ensure all skills are utilized over time,
+        while allowing per-timestep specialization (e.g., [90%, 5%, 5%] at one timestep,
+        [10%, 50%, 40%] at another timestep).
         
-        Allows: per-frame specialization (weights can focus on relevant skills per frame)
+        This approach:
+        - Allows: Per-timestep specialization (agent can focus on specific skills when needed)
+        - Encourages: All skills get used roughly equally OVER TIME across episodes
+        - Prevents: Complete collapse where one skill is always used
         """
         
         if not hasattr(self, 'training_weights') or len(self.training_weights) == 0:
             return torch.tensor(0.0, device=self.device)
         
-        if self.routing_entropy is None:
-            return torch.tensor(0.0, device=self.device)
-        
         # Stack recent weights: [num_timesteps, num_experts]
         # Each entry is already averaged over batch dimension
-        # Only use last 512 timesteps to prevent memory issues while keeping full history for plotting
-        recent_weights = torch.stack(self.training_weights[-512:])  # [T, E]
+        # Use last 1024 timesteps for stability
+        recent_weights = torch.stack(self.training_weights[-1024:])  # [T, E]
         
-        # 1. Load Balancing Loss
-        # Ensure each skill is used roughly equally over time
-        # Average weight per skill across all timesteps
+        # Load Balancing Loss
+        # Ensure each skill is used roughly equally over time (not per timestep)
+        # Average weight per skill across all recent timesteps
         avg_skill_usage = recent_weights.mean(dim=0)  # [num_experts]
         
-        # Target: uniform usage (1/num_experts)
+        # Target: uniform usage over time (1/num_experts)
         uniform_target = 1.0 / self.num_experts
         
         # Penalize deviation from uniform target (MSE loss)
-        # High when some experts are over/under-utilized
+        # High when some experts are over/under-utilized OVER TIME
         load_balance_loss = torch.mean((avg_skill_usage - uniform_target) ** 2)
         
-        # 2. Entropy Regularization
-        # Penalize low entropy (collapsed distributions)
-        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
-        
-        # Normalize entropy to [0, 1] where 1 = uniform, 0 = collapsed
-        normalized_entropy = self.routing_entropy / (max_entropy + 1e-10)
-        
-        # Loss increases as entropy decreases (collapsed)
-        entropy_penalty = 1.0 - normalized_entropy
-        
-        # Combine losses with tunable coefficients (from initialization)
-        total_loss = (self.entropy_coef * entropy_penalty) + (self.load_balance_coef * load_balance_loss)
-        #total_loss = self.load_balance_coef * load_balance_loss
-        return total_loss
+        # Return only load balance loss (scaled by coefficient)
+        return self.load_balance_coef * load_balance_loss
 
 
     
