@@ -258,7 +258,7 @@ train_agent(
     policy_kwargs, 
     seed, 
     run_id=args.run_id, 
-    train_steps=500000, 
+    train_steps=1000000, 
     wandb=True,
     weight_monitor=True
 )
