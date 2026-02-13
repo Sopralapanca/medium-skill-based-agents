@@ -209,6 +209,8 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
                 self.skills_embeddings[i]
             )  # pass through a mlp layer to reduce and fix the dimension
             
+            self.skills_embeddings[i] = F.normalize(self.skills_embeddings[i], dim=1)  # L2 normalize skill embeddings
+            
             concatenated = torch.cat([encoded_frame, self.skills_embeddings[i]], 1)
 
             weight: torch.Tensor = self.weights(concatenated)
