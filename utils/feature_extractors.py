@@ -216,8 +216,15 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
             weight: torch.Tensor = self.weights(concatenated)
             weights.append(weight)
 
-        weights = torch.stack(weights, 1)
-        weights = torch.softmax(weights, 1) # weights shape torch.Size([8, 4, 1])
+        weights = torch.stack(weights, 1) # weights shape torch.Size([8, 4, 1])
+        
+        # Before softmax, add gaussian noise for exploration (only during training)
+        if self.training:
+            noise = torch.randn_like(weights) * 0.1
+            weights = weights + noise
+        
+        weights = torch.softmax(weights, 1) 
+        #weights = torch.softmax(weights / self.temperature, 1) # weights shape torch.Size([8, 4, 1])
         
         # Store weights for load balancing loss (NOT detached for gradients)
         weights_2d = weights.squeeze(-1)  # [batch, num_experts]
