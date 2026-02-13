@@ -119,8 +119,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         features_dim: int = 256,
         skills: List[Skill] | None = None,
         device="cpu",
-        entropy_coef: float = 0.0001,
-        load_balance_coef: float = 0.000015,
     ):
         """
         :param observation_space: Gymnasium observation space
@@ -186,14 +184,9 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         # Track number of experts (skills) for auxiliary loss
         self.num_experts = len(self.skills)
         
-        # Store coefficients for auxiliary loss
-        self.entropy_coef = entropy_coef
-        self.load_balance_coef = load_balance_coef
-
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # print("forward observation shape", observations.shape)
         # -------------- saving stats -------------- #
-        
         
         weights: List[torch.Tensor] = []
 
@@ -232,10 +225,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         
         # Store detached version for monitoring/logging only
         self.training_weights.append(weights_2d.mean(dim=0).detach())
-        # if len(self.training_weights) > 1024:
-        #     self.training_weights = self.training_weights[-1024:]
-        
-        # weights = self.dropout(weights)
 
         # save attention weights to plot them in evaluation
         for i, s in enumerate(self.skills):

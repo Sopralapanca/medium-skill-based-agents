@@ -43,12 +43,13 @@ load_dotenv()
 # Parse command line arguments
 def parse_args():
     parser = argparse.ArgumentParser(description='Train RL agents with skill-based feature extractors')
-    parser.add_argument('--entropy_coef', type=float, default=0.0001,
-                        help='Entropy coefficient for auxiliary loss (default: 0.0001)')
-    parser.add_argument('--load_balance_coef', type=float, default=0.000015,
-                        help='Load balance coefficient for auxiliary loss (default: 0.000015)')
+    
     parser.add_argument('--run_id', type=str,
                         help='Run ID for logging and saving models (default: load_balancing_loss_2)')
+    parser.add_argument('--mode', type=str, default='wsa', choices=['ppo', 'wsa'],
+                        help='Training mode: "ppo" for standard PPO, "wsa" for PPO with Weight Sharing Attention Extractor (default: wsa)')
+    parser.add_argument('--env', type=str, default='PongNoFrameskip-v4',
+                        help='Environment ID to train on (default: PongNoFrameskip-v4)')
     return parser.parse_args()
 
 
@@ -140,7 +141,7 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     if wandb:
         callbacks.append(WandbCallback(verbose=0))
 
-    if weight_monitor:
+    if weight_monitor and configs["f_ext_name"] != "ppo" and wandb:
         # Get the feature extractor from the model
         feature_extractor = model.policy.features_extractor
 
@@ -158,29 +159,51 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     try:    
         model.learn(train_steps, callback=callbacks, progress_bar=True)
     except KeyboardInterrupt:
-        weight_monitor._on_training_end()
-        sys.exit(0)
+        if weight_monitor and configs["f_ext_name"] != "ppo" and wandb:
+            weight_monitor._on_training_end()
+            sys.exit(0)
     
-    if run is not None:
+    if run is not None and wandb:
         run.finish()
-        
-    # #Plot the results
-    # if weight_monitor:
-    #     weights_file = weight_monitor.weights_file
-    #     if os.path.exists(weights_file):
-    #         plot_gating_distribution(weights_file, output_dir=weight_monitor.save_path)
-    #     else:
-    #         raise FileNotFoundError(f"Warning: Weights file not found at {weights_file}")
+    
+def setup_skilled_agent(env, environment_configuration, policy_kwargs, seed, extractor):
+    test_envs = create_env(
+        env_id=env, 
+        configs=environment_configuration, 
+        seed=seed
+    )
+    obs = test_envs.reset()
+
+    # init skills
+    usr = UnsupervisedStateRepresentationModel(observation=obs[0], device=device)
+    vok = Transporter().to(device)
+    vos = VideoObjectSegmentationModel(device=device)
 
 
-        
+    skills = [
+        usr.get_skill(device=device),
+        vok.get_skill(device=device, keynet_or_encoder="encoder"),
+        vok.get_skill(device=device, keynet_or_encoder="keynet"),
+        vos.get_skill(device=device)
+    ]
+    
 
-# Load config
-_config_path = "./configs.yaml"
-
-_config = {}
-with open(_config_path, "r") as f:
-    _config = yaml.safe_load(f) or {}
+    f_ext_kwargs = environment_configuration["f_ext_kwargs"]
+    
+    if extractor == "wsa":    
+        environment_configuration["f_ext_name"] = "wsa_ext"
+        environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
+    elif extractor == "moe":
+        environment_configuration["f_ext_name"] = "moe_ext"
+        environment_configuration["f_ext_class"] = SoftHardMOE
+    
+    f_ext_kwargs["skills"] = skills
+    f_ext_kwargs["features_dim"] = 256
+    
+    policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
+    policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
+    
+    return environment_configuration, policy_kwargs
 
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # ignore tensorflow warnings about CPU
@@ -203,15 +226,13 @@ torch.backends.cudnn.benchmark = False
 # For PyTorch >= 1.8
 torch.use_deterministic_algorithms(True, warn_only=True)
 
-
-#envs = _config.get("ENVS", ["PongNoFrameskip-v4"])[0]
-env = "PongNoFrameskip-v4"
-with open(f'environment_configs/{env}.yaml', 'r') as file:
+env = args.env
+with open('environment_configs/AtariNoFrameskip-v4.yaml', 'r') as file:
         environment_configuration = yaml.safe_load(file)["config"]
-
 
 environment_configuration["f_ext_kwargs"]["device"] = device  #do not comment this, it is the parameter passed to the feature extractor
 environment_configuration["game"] = env
+environment_configuration["f_ext_name"] = "ppo" # default to PPO extractor, will be updated in setup_skilled_agent if using a skill-based extractor
 
 
 policy_kwargs = dict(
@@ -222,34 +243,10 @@ policy_kwargs = dict(
     # activation_fn=torch.nn.ReLU,  # use ReLU in case of multiple layers for the policy learning network
 )
 
-test_envs = create_env(env_id=env, configs=environment_configuration, seed=seed)
-obs = test_envs.reset()
-
-# init skills
-autoencoder = Autoencoder(channels=1).to(device)
-usr = UnsupervisedStateRepresentationModel(observation=obs[0], device=device)
-vok = Transporter().to(device)
-vos = VideoObjectSegmentationModel(device=device)
-
-
-skills = [
-    usr.get_skill(device=device),
-    vok.get_skill(device=device, keynet_or_encoder="encoder"),
-    vok.get_skill(device=device, keynet_or_encoder="keynet"),
-    vos.get_skill(device=device)
-]
-   
-
-f_ext_kwargs = environment_configuration["f_ext_kwargs"]
-environment_configuration["f_ext_name"] = "moe_ext"
-environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
-f_ext_kwargs["skills"] = skills
-f_ext_kwargs["features_dim"] = 256
-f_ext_kwargs["entropy_coef"] = args.entropy_coef
-f_ext_kwargs["load_balance_coef"] = args.load_balance_coef
-
-policy_kwargs["features_extractor_class"] = environment_configuration["f_ext_class"]
-policy_kwargs["features_extractor_kwargs"] = f_ext_kwargs
+if args.mode == "wsa":
+    environment_configuration, policy_kwargs = setup_skilled_agent(env, environment_configuration, policy_kwargs, seed, extractor="wsa")
+elif args.mode == "moe":
+    environment_configuration, policy_kwargs = setup_skilled_agent(env, environment_configuration, policy_kwargs, seed, extractor="moe")
 
 
 train_agent(
