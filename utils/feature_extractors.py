@@ -17,8 +17,9 @@ def get_embedding_for_context(
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             z = encoder(observations)
             z = torch.reshape(z, (z.size(0), -1))
-
-        return z
+        
+        # Convert back to float32 for downstream processing
+        return z.float()
 
 
 class FeaturesExtractor(BaseFeaturesExtractor):

@@ -68,7 +68,7 @@ def create_env(env_id, configs, seed=None):
         env_id, 
         n_envs=configs["n_envs"], 
         seed=seed,
-        vec_env_cls=SubprocVecEnv
+        #vec_env_cls=SubprocVecEnv
     )
     env = VecFrameStack(env, n_stack=configs["n_stacks"])
     env = VecTransposeImage(env)
