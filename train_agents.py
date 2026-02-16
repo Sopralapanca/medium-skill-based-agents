@@ -13,13 +13,12 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # For deterministic CUDA oper
 
 # training imports
 from stable_baselines3.common.env_util import make_atari_env
-from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage
+from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage, SubprocVecEnv
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold, StopTrainingOnNoModelImprovement
 
 from stable_baselines3 import PPO
 from rl_zoo3.utils import linear_schedule
 
-from skills.autoencoder import Autoencoder
 from skills.unsupervised_state_representation import UnsupervisedStateRepresentationModel
 from skills.video_object_keypoints import Transporter
 from skills.video_object_segmentation import VideoObjectSegmentationModel
@@ -27,6 +26,9 @@ from skills.video_object_segmentation import VideoObjectSegmentationModel
 from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
 from utils.custom_ppo import CustomPPO
 from utils.monitor_weights import WeightMonitorCallback, plot_gating_distribution
+from utils.envpool_wrapper import create_envpool_env
+
+import time
 
 # IMPORTANT - REGISTER THE ENVIRONMENTS
 import gymnasium as gym
@@ -62,7 +64,12 @@ args = parse_args()
 
 
 def create_env(env_id, configs, seed=None):
-    env = make_atari_env(env_id, n_envs=configs["n_envs"], seed=seed)
+    env = make_atari_env(
+        env_id, 
+        n_envs=configs["n_envs"], 
+        seed=seed,
+        vec_env_cls=SubprocVecEnv
+    )
     env = VecFrameStack(env, n_stack=configs["n_stacks"])
     env = VecTransposeImage(env)
     return env
@@ -100,6 +107,7 @@ def train_agent(env_id, configs, policy_kwargs, seed, run_id="", train_steps=500
     logdir = "./tensorboard_logs"
             
     vec_envs = create_env(env_id=env_id, configs=configs, seed=seed)
+    #vec_envs = create_envpool_env(env_id=env_id, configs=configs, seed=seed)
     _ = vec_envs.reset()
     
     #eval_envs = create_env(env_id=env_id, configs=configs, seed=None)
@@ -248,6 +256,7 @@ if args.mode == "wsa":
 elif args.mode == "moe":
     environment_configuration, policy_kwargs = setup_skilled_agent(env, environment_configuration, policy_kwargs, seed, extractor="moe")
 
+start_time = time.time()
 
 train_agent(
     env, 
@@ -255,7 +264,11 @@ train_agent(
     policy_kwargs, 
     seed, 
     run_id=args.run_id, 
-    train_steps=1000000, 
-    wandb=True,
+    train_steps=5000, 
+    wandb=False,
     weight_monitor=True
 )
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Training completed in {elapsed_time:.4f} seconds")
