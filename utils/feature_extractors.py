@@ -14,7 +14,7 @@ def get_embedding_for_context(
     ) -> torch.Tensor:
         """Extract context for routing decisions"""
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             z = encoder(observations)
             z = torch.reshape(z, (z.size(0), -1))
 
@@ -91,7 +91,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         for idx in skills_to_process:
             skill = self.skills[idx]
             # this apply a skill to the observations
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 so = skill.input_adapter(observations)
                 so = skill.skill_output(
                     skill.skill_model, so
@@ -104,7 +104,9 @@ class FeaturesExtractor(BaseFeaturesExtractor):
             # flatten skill out to linear embedding
             if len(so.shape) > 2:
                 so = torch.reshape(so, (so.size(0), -1))
-
+            
+            # Convert back to float32 for downstream processing
+            so = so.float()
             self.skills_embeddings.append(so)
 
     def get_dimension(self, observations: torch.Tensor) -> int:

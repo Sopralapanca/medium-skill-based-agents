@@ -1,13 +1,13 @@
-# Pong configuration file
+# every n_envs * n_step there is a policy update phase
 
 config : {
 
-    "n_envs": 4,
+    "n_envs": 8,
     "n_stacks": 4,
 
-    "n_steps": 256,
-    "n_epochs": 8,
-    "batch_size": 512,
+    "n_steps": 128,
+    "n_epochs": 4,
+    "batch_size": 256,
     "n_timesteps": 10000000, #1e7
     "learning_rate": 2.5e-4,
     "clip_range": 0.1,
