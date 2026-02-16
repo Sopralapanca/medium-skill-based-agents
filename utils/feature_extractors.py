@@ -66,6 +66,15 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         self.__kpt_key_adapter.to(device)
 
         self.skills_embeddings: List[torch.Tensor] = []
+        
+        # Store device and create CUDA streams for parallel processing
+        self.device = device
+        self.use_cuda_streams = device != "cpu" and torch.cuda.is_available()
+        if self.use_cuda_streams and skills is not None:
+            # Create one stream per skill for parallel execution
+            self.cuda_streams = [torch.cuda.Stream() for _ in range(len(skills))]
+        else:
+            self.cuda_streams = None
 
         # self.num_channels = 0
         # for el in self.skills_embeddings:
@@ -81,33 +90,71 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         :param observations: torch tensor of shape (n_envs, n_stacked_frames, height, width)
         :param skill_indices: list of skill indices to process (None = process all skills)
         """
-        self.skills_embeddings = []
-
         # If skill_indices not provided, process all skills (for WSA compatibility)
         skills_to_process = (
-            skill_indices if skill_indices is not None else range(len(self.skills))
+            list(skill_indices) if skill_indices is not None else list(range(len(self.skills)))
         )
-
-        for idx in skills_to_process:
-            skill = self.skills[idx]
-            # this apply a skill to the observations
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                so = skill.input_adapter(observations)
-                so = skill.skill_output(
-                    skill.skill_model, so
-                )  # can return linear or spatial embeddings
-
-            if skill.name in self.adapters:
-                adapter = self.adapters[skill.name]
-                so = adapter(so)
-
-            # flatten skill out to linear embedding
-            if len(so.shape) > 2:
-                so = torch.reshape(so, (so.size(0), -1))
+        
+        # Parallel processing with CUDA streams (when available)
+        if self.use_cuda_streams:
+            # Create temporary storage for results (indexed by position in skills_to_process)
+            temp_embeddings = [None] * len(skills_to_process)
             
-            # Convert back to float32 for downstream processing
-            so = so.float()
-            self.skills_embeddings.append(so)
+            # Launch all skill computations in parallel on separate streams
+            for i, idx in enumerate(skills_to_process):
+                skill = self.skills[idx]
+                stream = self.cuda_streams[idx]
+                
+                with torch.cuda.stream(stream):
+                    with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        so = skill.input_adapter(observations)
+                        so = skill.skill_output(
+                            skill.skill_model, so
+                        )  # can return linear or spatial embeddings
+
+                        if skill.name in self.adapters:
+                            adapter = self.adapters[skill.name]
+                            so = adapter(so)
+                    
+                    # flatten skill out to linear embedding
+                    if len(so.shape) > 2:
+                        so = torch.reshape(so, (so.size(0), -1))
+                    
+                    # Convert back to float32 for downstream processing
+                    so = so.float()
+                    temp_embeddings[i] = so
+            
+            # Synchronize all streams to ensure all computations are complete
+            for idx in skills_to_process:
+                self.cuda_streams[idx].synchronize()
+            
+            # Store results in order
+            self.skills_embeddings = temp_embeddings
+            
+        else:
+            # Sequential processing (CPU or when CUDA streams not available)
+            self.skills_embeddings = []
+            
+            for idx in skills_to_process:
+                skill = self.skills[idx]
+                # this apply a skill to the observations
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    so = skill.input_adapter(observations)
+                    so = skill.skill_output(
+                        skill.skill_model, so
+                    )  # can return linear or spatial embeddings
+
+                    if skill.name in self.adapters:
+                        adapter = self.adapters[skill.name]
+                        so = adapter(so)
+
+                # flatten skill out to linear embedding
+                if len(so.shape) > 2:
+                    so = torch.reshape(so, (so.size(0), -1))
+                
+                # Convert back to float32 for downstream processing
+                so = so.float()
+                self.skills_embeddings.append(so)
 
     def get_dimension(self, observations: torch.Tensor) -> int:
         out = self.forward(observations)
