@@ -70,11 +70,13 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         
         # Store device and create CUDA streams for parallel processing
         self.device = device
-        self.use_cuda_streams = device != "cpu" and torch.cuda.is_available()
+        self.use_cuda_streams = False #device != "cpu" and torch.cuda.is_available()
         if self.use_cuda_streams and skills is not None:
+            print("Using CUDA streams for parallel skill processing")
             # Create one stream per skill for parallel execution
             self.cuda_streams = [torch.cuda.Stream() for _ in range(len(skills))]
         else:
+            print("CUDA streams not available, using sequential processing")
             self.cuda_streams = None
 
         # self.num_channels = 0
