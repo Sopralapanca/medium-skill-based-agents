@@ -10,13 +10,18 @@ import numpy as np
 
 def get_embedding_for_context(
         observations: torch.Tensor,
-        encoder
+        encoder,
+        detach: bool = True
     ) -> torch.Tensor:
         """Extract context for routing decisions"""
 
-        with torch.no_grad():
+        if detach:
+            with torch.no_grad():
+                z = encoder(observations)
+        else:
             z = encoder(observations)
-            z = torch.reshape(z, (z.size(0), -1))
+
+        z = torch.reshape(z, (z.size(0), -1))
 
         return z
 
@@ -125,8 +130,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         :param features_dim: Number of features extracted from the observations. This corresponds to the number of units for the last layer.
         :param skills: List of skill objects.
         :param device: Device used for computation.
-        :param entropy_coef: Coefficient for entropy regularization in auxiliary loss.
-        :param load_balance_coef: Coefficient for load balancing in auxiliary loss.
         """
         super().__init__(observation_space, features_dim, skills, device)
 
@@ -217,7 +220,6 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
             weights = weights + noise
         
         weights = torch.softmax(weights, 1) 
-        #weights = torch.softmax(weights / self.temperature, 1) # weights shape torch.Size([8, 4, 1])
         
         # Store weights for load balancing loss (NOT detached for gradients)
         weights_2d = weights.squeeze(-1)  # [batch, num_experts]
@@ -238,44 +240,8 @@ class WeightSharingAttentionExtractor(FeaturesExtractor):
         att_out = torch.sum(att_out, 1)
         final_out = self.final_layer_norm(att_out)
         return final_out
-    
-    # def get_auxiliary_loss(self) -> torch.Tensor:
-    #     """Auxiliary loss to encourage skill diversity over long time horizons.
-        
-    #     Uses a two-component approach:
-    #     1. Long-term load balancing: Tracks skill usage via EMA across many batches,
-    #        encouraging uniform usage over episodes/training (allows per-timestep specialization)
-    #     2. Current batch guidance: Gently nudges current batch toward the long-term target
-    #        to prevent sudden collapse while allowing dynamic, context-dependent routing
-        
-    #     This enables:
-    #     - Per-timestep specialization: t=[0.10, 0.60, 0.05, 0.25], t+1=[0.70, 0.10, 0.10, 0.10]
-    #     - Per-batch adaptation: Batch can be biased toward relevant skills for current game states
-    #     - Long-term balance: Over thousands of steps, all skills used roughly equally
-    #     """
-        
-    #     if self.current_batch_weights is None:
-    #         return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-    #     # Shape: [batch_size, num_experts]
-    #     batch_weights = self.current_batch_weights
-        
-    #     # Average usage in current batch (with gradients)
-    #     avg_batch_usage = batch_weights.mean(dim=0)  # [num_experts]
-        
-    #     # Target: uniform distribution (1/num_experts for each expert)
-    #     uniform_target = 1.0 / self.num_experts
-        
 
-    #     # Gradient flows through avg_batch_usage -> current_batch_weights
-    #     load_balance_loss = torch.mean((avg_batch_usage - uniform_target) ** 2)
-        
-    #     return self.load_balance_coef * load_balance_loss
-
-
-    
-    
-class SoftHardMOE(FeaturesExtractor):
+class MixtureOfExpertsExtractor(FeaturesExtractor):
     def __init__(
         self,
         observation_space: spaces.Box,
@@ -283,190 +249,100 @@ class SoftHardMOE(FeaturesExtractor):
         skills: List[Skill] | None = None,
         device="cpu",
     ):
-        """
-        Mixture of Experts with soft-to-hard routing transition.
-        
-        :param observation_space: Gymnasium observation space
-        :param features_dim: Number of features extracted from the observations
-        :param skills: List of skill objects (experts)
-        :param device: Device used for computation
-        """
-
         super().__init__(observation_space, features_dim, skills, device)
 
         self.device = device
-        
-        # temperature annealing parameters
-        self.temperature = 1.0  # Start with soft routing
-        self.min_temperature = 0.1      # End with nearly-hard routing
-        self.temperature_decay = 0.99998  # Gradual annealing (tune this!)
-        self.step_count = 0
-               
-        # expert dropout parameters
-        self.p_keep = 0.8  # Probability to keep each expert active during training
-        
-        # EMA for temporal smoothing
-        self.ema_alpha = 0.95  # Smoothing factor (0.9 = heavy smoothing)
-        self.register_buffer('ema_weights', None)  # Persistent across forward passes
-        self.smoothing_factor = 0.8
+        self._moe_features_dim = features_dim
+        self.top_k = 3
 
-        self.num_experts = len(skills)
-
-        sample = observation_space.sample()  # 4x84x84
-        sample = np.expand_dims(sample, axis=0)  # 1x4x84x84
+        sample = observation_space.sample()
+        sample = np.expand_dims(sample, axis=0)
         sample = torch.from_numpy(sample) / 255
         sample = sample.to(device)
 
-        # Context encoder for routing decisions
-        model_path = "skills/torch_models/nature-encoder-all-envs.pt"
-        model = Autoencoder().to(device)
-        model = torch.compile(model, mode="reduce-overhead")
-        model.load_state_dict(torch.load(model_path, map_location=device), strict=True)
-        model.eval()
-        self.encoder = model.encoder
-        
-        
-        z = get_embedding_for_context(sample, self.encoder)
-        self.input_size = z.shape[-1]
+        # Trainable context encoder with the same architecture as the pretrained autoencoder encoder.
+        self.encoder = Autoencoder().encoder.to(device)
 
-        # Router network: takes context and outputs logits for each expert
-        self.router = nn.Sequential(
-            nn.Linear(self.input_size, features_dim, device=device),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(features_dim, len(self.skills), device=device),
-        )
-        
-        # Initialize router to output near-uniform logits
-        with torch.no_grad():
-            self.router[-1].weight.data *= 0.1  # Small random weights
-            self.router[-1].bias.data.zero_()    # Zero bias = uniform start
+        self.preprocess_input(sample)
 
-        # MLP layers for each skill to project to features_dim
-        self.preprocess_input(sample)  # populate self.skills_embeddings
-        
         self.mlp_layers = nn.ModuleList()
         for i in range(len(self.skills_embeddings)):
             seq_layer = nn.Sequential(
+                nn.LayerNorm(self.skills_embeddings[i].shape[1], device=device),
                 nn.Linear(
                     self.skills_embeddings[i].shape[1], features_dim, device=device
                 ),
-                nn.LayerNorm(features_dim),
                 nn.ReLU(),
             )
-
             self.mlp_layers.append(seq_layer)
 
-        # Tracking
-        self.training_weights = []
-        
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        observations = observations.to(self.device)
-        batch_size = observations.shape[0]
+        z = get_embedding_for_context(sample, self.encoder, detach=False)
+        self.input_size = z.shape[-1]
 
-        # Get routing logits from context
-        context = get_embedding_for_context(observations, self.encoder)
-        router_logits = self.router(context)  # (batch_size, num_experts)
-        
-        # Compute routing weights with Gumbel-Softmax
-        router_weights = F.gumbel_softmax(router_logits, tau=self.temperature, hard=False)
-        
-        # Calculate entropy of routing distribution (per sample in batch)
-        entropy = -torch.sum(router_weights * torch.log(router_weights + 1e-10), dim=1)
-        
-        # Store for auxiliary loss
-        self.routing_entropy = entropy.mean()
-        
-        #Apply EMA smoothing (prevents drastic changes)
-        if self.ema_weights is None:
-            # First step after warmup: initialize with current weights
-            self.ema_weights = router_weights.detach().mean(dim=0)  # Average over batch
-        else:
-            # Smooth: new_weights = alpha * old + (1-alpha) * new
-            batch_mean_weights = router_weights.detach().mean(dim=0)
-            self.ema_weights = self.ema_alpha * self.ema_weights + (1 - self.ema_alpha) * batch_mean_weights
-    
-        router_weights = self.smoothing_factor * self.ema_weights.unsqueeze(0) + (1 - self.smoothing_factor) * router_weights
-        
-        # Apply expert dropout AFTER EMA smoothing (only during training)
-        # This ensures dropped experts are truly zeroed out
-        if self.training:
-            drop_mask = torch.bernoulli(
-                torch.full((batch_size, self.num_experts), self.p_keep, device=self.device)
-            )
-            router_weights = router_weights * drop_mask
-            # Re-normalize so weights still sum to 1
-            router_weights = router_weights / (router_weights.sum(dim=1, keepdim=True) + 1e-10)
-            
-        # Anneal temperature for soft-to-hard transition
-        self.temperature = max(
-            self.min_temperature,
-            self.temperature * self.temperature_decay
+        self.encoder_lin_layer = nn.Sequential(
+            nn.LayerNorm(self.input_size, device=device),
+            nn.Linear(self.input_size, features_dim, device=device),
+            nn.ReLU(),
         )
-        
-        self.step_count += 1
 
-        # Process ALL experts (soft routing - no information loss)
-        self.preprocess_input(observations)  # Processes all skills
+        self.router = nn.Sequential(
+            nn.LayerNorm(features_dim, device=device),
+            nn.Linear(features_dim, len(self.skills), device=device),
+        )
 
-        # Weighted combination of expert outputs
-        output = torch.zeros(batch_size, self.features_dim, device=self.device)
-        
-        for i in range(self.num_experts):
-            # Get skill embedding (already computed for all experts)
-            skill_embedding = self.skills_embeddings[i]  # (batch_size, embedding_dim)
-            
-            # Project through trainable MLP
-            skill_embedding = self.mlp_layers[i](skill_embedding)  # (batch_size, features_dim)
-            
-            # Weight by router decision
-            expert_weight = router_weights[:, i].unsqueeze(1)  # (batch_size, 1)
-            weighted_output = skill_embedding * expert_weight  # (batch_size, features_dim)
-            
-            output += weighted_output
+        self.final_layer_norm = nn.LayerNorm(features_dim, device=device)
 
-        # Store weights for visualization
-        self.training_weights.append(router_weights.detach())
+        self.att_weights = {}
+        self.training_weights = []
+        self.current_batch_weights = None
+        self.num_experts = len(self.skills)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        encoded_frame = get_embedding_for_context(
+            observations,
+            self.encoder,
+            detach=False,
+        )
+        encoded_frame = self.encoder_lin_layer(encoded_frame)
+
+        router_logits = self.router(encoded_frame)
+
+        if self.training:
+            noise = torch.randn_like(router_logits) * 0.1
+            router_logits = router_logits + noise
+
+        top_k = min(self.top_k, router_logits.shape[1])
+        topk_values, topk_indices = torch.topk(router_logits, top_k, dim=1)
+        topk_weights = torch.softmax(topk_values, dim=1)
+
+        weights = torch.zeros_like(router_logits)
+        weights.scatter_(1, topk_indices, topk_weights)
+
+        self.current_batch_weights = weights
+        self.training_weights.append(weights.mean(dim=0).detach())
+
+        for i, s in enumerate(self.skills):
+            self.att_weights[s.name] = [w[i] for w in weights]
+
+        selected_experts = torch.unique(topk_indices).detach().cpu().tolist()
+        self.preprocess_input(observations, skill_indices=selected_experts)
+
+        expert_outputs = torch.zeros(
+            observations.shape[0],
+            self.num_experts,
+            self._moe_features_dim,
+            device=observations.device,
+            dtype=encoded_frame.dtype,
+        )
+
+        for skill_position, expert_idx in enumerate(selected_experts):
+            seq_layer = self.mlp_layers[expert_idx]
+            expert_embedding = seq_layer(self.skills_embeddings[skill_position])
+            expert_embedding = F.normalize(expert_embedding, dim=1)
+            expert_outputs[:, expert_idx, :] = expert_embedding
+
+        att_out = weights.unsqueeze(-1) * expert_outputs
+        att_out = torch.sum(att_out, dim=1)
+        final_out = self.final_layer_norm(att_out)
+        return final_out
     
-        return output
-    
-    def get_auxiliary_loss(self) -> torch.Tensor:
-        """Entropy and load balancing loss for the router.
-        
-        Returns a non-negative penalty that:
-        - Is HIGH when routing collapses (low entropy, imbalanced usage)
-        - Is LOW when routing is diverse (high entropy, balanced usage)
-        """
-        
-        if not hasattr(self, 'training_weights') or len(self.training_weights) == 0 or not hasattr(self, 'routing_entropy'):
-            return torch.tensor(0.0, device=self.device)
-
-        # 1. Entropy regularization: penalize distance from maximum entropy
-        # Maximum entropy for uniform distribution over N experts: log(N)
-        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=self.device))
-        
-        # Penalty is 0 when entropy is maximum (diverse), increases as entropy drops (collapsed)
-        entropy_penalty = max_entropy - self.routing_entropy
-        entropy_coefficient = 0.01
-        entropy_loss = entropy_coefficient * entropy_penalty
-        
-        return entropy_loss 
-    
-    # def get_auxiliary_loss(self) -> torch.Tensor:
-    #     """Load balancing loss to prevent expert collapse"""
-    #     if not hasattr(self, 'training_weights') or len(self.training_weights) == 0:
-    #         return torch.tensor(0.0, device=self.device)
-        
-    #     # Get recent routing decisions (last N batches)
-    #     recent_weights = torch.cat(self.training_weights[-500:], dim=0)  # Shape: [batch*10, num_experts]
-        
-    #     # Calculate average usage per expert
-    #     avg_expert_usage = recent_weights.mean(dim=0)  # Shape: [num_experts]
-        
-    #     # Target: each expert used equally (1/num_experts)
-    #     target_usage = 1.0 / self.num_experts
-        
-    #     # Penalize deviation from uniform usage
-    #     load_balance_loss = torch.sum((avg_expert_usage - target_usage) ** 2)
-        
-    #     return 0.01 * load_balance_loss  # Tune coefficient

@@ -24,7 +24,7 @@ from skills.unsupervised_state_representation import UnsupervisedStateRepresenta
 from skills.video_object_keypoints import Transporter
 from skills.video_object_segmentation import VideoObjectSegmentationModel
 
-from utils.feature_extractors import WeightSharingAttentionExtractor, SoftHardMOE
+from utils.feature_extractors import WeightSharingAttentionExtractor, MixtureOfExpertsExtractor
 from utils.custom_ppo import CustomPPO
 from utils.monitor_weights import WeightMonitorCallback, plot_gating_distribution
 
@@ -46,7 +46,7 @@ def parse_args():
     
     parser.add_argument('--run_id', type=str,
                         help='Run ID for logging and saving models (default: load_balancing_loss_2)')
-    parser.add_argument('--mode', type=str, default='wsa', choices=['ppo', 'wsa'],
+    parser.add_argument('--mode', type=str, choices=['ppo', 'wsa', 'moe'],
                         help='Training mode: "ppo" for standard PPO, "wsa" for PPO with Weight Sharing Attention Extractor (default: wsa)')
     parser.add_argument('--env', type=str, default='PongNoFrameskip-v4',
                         help='Environment ID to train on (default: PongNoFrameskip-v4)')
@@ -195,7 +195,7 @@ def setup_skilled_agent(env, environment_configuration, policy_kwargs, seed, ext
         environment_configuration["f_ext_class"] = WeightSharingAttentionExtractor
     elif extractor == "moe":
         environment_configuration["f_ext_name"] = "moe_ext"
-        environment_configuration["f_ext_class"] = SoftHardMOE
+        environment_configuration["f_ext_class"] = MixtureOfExpertsExtractor
     
     f_ext_kwargs["skills"] = skills
     f_ext_kwargs["features_dim"] = 256
@@ -255,7 +255,7 @@ train_agent(
     policy_kwargs, 
     seed, 
     run_id=args.run_id, 
-    train_steps=1000000, 
-    wandb=True,
-    weight_monitor=True
+    train_steps=1000, 
+    wandb=False,
+    weight_monitor=False
 )

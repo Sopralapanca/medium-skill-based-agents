@@ -97,7 +97,9 @@ class WeightMonitorCallback(BaseCallback):
         dominant_idx = np.argmax(mean_weights)
         log_dict["attention_weights/dominant_expert_idx"] = dominant_idx
         
-        wandb.log(log_dict, step=self.num_timesteps)
+        # Don't pass step parameter due to tensorboard syncing conflict
+        # wandb will use the global step from tensorboard sync
+        wandb.log(log_dict)
     
     def _on_training_end(self) -> None:
         """Save all collected weights at the end of training"""
